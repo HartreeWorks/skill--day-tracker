@@ -53,7 +53,7 @@ def format_duration(minutes: int) -> str:
     return f"{hours}h {mins}m"
 
 
-def calculate_stats(daily_log: DailyLog, interval_minutes: int = 5, max_gap_minutes: int = 15) -> dict:
+def calculate_stats(daily_log: DailyLog, interval_minutes: int = 2, max_gap_minutes: int = 15) -> dict:
     """Calculate time statistics from daily log using actual timestamps.
 
     Instead of assuming each entry represents a fixed interval, we calculate
@@ -143,7 +143,7 @@ def calculate_stats(daily_log: DailyLog, interval_minutes: int = 5, max_gap_minu
     }
 
 
-def generate_enhanced_summary(daily_log: DailyLog, interval_minutes: int = 5, max_gap_minutes: int = 15) -> dict:
+def generate_enhanced_summary(daily_log: DailyLog, interval_minutes: int = 2, max_gap_minutes: int = 15) -> dict:
     """Generate rich daily summary for Chief of Staff by reading metadata files.
 
     This aggregates detailed context (people, organizations) from individual

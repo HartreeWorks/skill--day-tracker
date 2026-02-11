@@ -5,7 +5,7 @@ Day Tracker Capture Script
 Captures screenshots and active window information, analyzes with Gemini,
 and saves to the daily log.
 
-Run via launchd every 5 minutes, or manually for testing.
+Run via launchd every 2 minutes, or manually for testing.
 """
 
 import subprocess

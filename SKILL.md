@@ -9,7 +9,7 @@ A local-first screenshot-based time tracker with AI analysis.
 
 ## Overview
 
-Day Tracker captures screenshots every 5 minutes, analyzes them with Gemini 2.5 Flash-Lite to understand what you're working on, and provides:
+Day Tracker captures screenshots every 2 minutes, analyzes them with Gemini 2.5 Flash-Lite to understand what you're working on, and provides:
 - Timeline view of your day (multi-monitor support)
 - Time breakdown by category and project
 - AI-generated daily summaries
@@ -29,7 +29,7 @@ python3 ~/.claude/skills/day-tracker/server.py
 
 ## Scheduled Capture
 
-The capture runs every 5 minutes via the `schedule-task` skill:
+The capture runs every 2 minutes via the `schedule-task` skill:
 
 ```bash
 # View status
@@ -141,7 +141,7 @@ Edit `~/Documents/day-tracker/data/config.json`:
 
 ```json
 {
-  "capture_interval_minutes": 5,
+  "capture_interval_minutes": 2,
   "gemini_model": "gemini-2.5-flash-lite",
   "skip_similar_threshold": 0.02,
   "project_patterns": [
@@ -250,4 +250,4 @@ Features:
 
 ## Cost
 
-Using Gemini 2.5 Flash-Lite: ~$0.04/day (~$1.20/month) at 288 captures/day.
+Using Gemini 2.5 Flash-Lite: approx. $0.10/day ($3/month) at 720 captures/day.

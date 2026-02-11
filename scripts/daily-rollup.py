@@ -25,7 +25,7 @@ DAILY_DIR = DATA_DIR / "daily"
 PROJECTS_YAML = Path.home() / "Documents" / "Projects" / "projects.yaml"
 
 # Capture interval in minutes (used for time estimation)
-CAPTURE_INTERVAL = 5
+CAPTURE_INTERVAL = 2
 # Gap threshold for attributing unclassified entries (minutes)
 GAP_THRESHOLD = 15
 # Minimum captures to consider data reliable

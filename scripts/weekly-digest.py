@@ -23,7 +23,7 @@ DATA_DIR = Path.home() / "Documents" / "day-tracker" / "data"
 DAILY_DIR = DATA_DIR / "daily"
 PROJECTS_YAML = Path.home() / "Documents" / "Projects" / "projects.yaml"
 
-CAPTURE_INTERVAL = 5
+CAPTURE_INTERVAL = 2
 LOW_DATA_THRESHOLD = 20
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 

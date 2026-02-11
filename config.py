@@ -51,7 +51,7 @@ CATEGORIES = {
 
 # Default configuration
 DEFAULT_CONFIG = {
-    "capture_interval_minutes": 5,
+    "capture_interval_minutes": 2,
     "gemini_model": "gemini-2.5-flash-lite",  # Options: gemini-2.5-flash-lite, gemini-2.5-flash, gemini-3-flash-preview
     "jpeg_quality": 70,
     "thumbnail_size": [400, 225],  # 16:9 aspect
@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
 @dataclass
 class CaptureConfig:
     """Runtime configuration for capture."""
-    capture_interval_minutes: int = 5
+    capture_interval_minutes: int = 2
     gemini_model: str = "gemini-2.5-flash-lite"
     jpeg_quality: int = 50
     thumbnail_size: tuple = (400, 225)

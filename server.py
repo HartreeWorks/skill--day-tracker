@@ -530,7 +530,7 @@ async def export_invoice(
     entries = []
     current = datetime.strptime(start, "%Y-%m-%d")
     end_date = datetime.strptime(end, "%Y-%m-%d")
-    interval_minutes = 5  # Default capture interval
+    interval_minutes = 2  # Default capture interval
 
     while current <= end_date:
         date_str = current.strftime("%Y-%m-%d")

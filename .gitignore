@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Compiled app binary (rebuild with swiftc if needed)
+DayTrackerCapture.app/Contents/MacOS/DayTrackerCapture
+
+# Claude Code local settings
+.claude/
+
+# Virtual environment
+.venv/
+
+# Temp files
+tmp/
+
+# Logs
+*.log
+*.err

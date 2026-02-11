@@ -1,0 +1,51 @@
+#!/bin/bash
+# Returns active window info and visible apps as JSON
+# Requires Accessibility permission for this app only
+
+# Get raw data from AppleScript with ||| delimiters
+RAW=$(osascript <<'APPLESCRIPT'
+try
+    tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        set appName to name of frontApp
+        try
+            set windowTitle to name of front window of frontApp
+        on error
+            set windowTitle to ""
+        end try
+
+        set visibleApps to name of every application process whose visible is true
+        set appList to ""
+        repeat with a in visibleApps
+            set appList to appList & a & "|||"
+        end repeat
+    end tell
+
+    return appName & "<<<SEP>>>" & windowTitle & "<<<SEP>>>" & appList
+on error errMsg
+    return "<<<ERROR>>>" & errMsg
+end try
+APPLESCRIPT
+)
+
+# Use Python to safely encode as JSON (handles Unicode properly)
+/usr/bin/python3 -c "
+import json
+import sys
+
+raw = '''$RAW'''
+
+if raw.startswith('<<<ERROR>>>'):
+    print(json.dumps({'error': raw[11:]}))
+else:
+    parts = raw.split('<<<SEP>>>')
+    if len(parts) >= 3:
+        title = parts[1] if parts[1] != 'missing value' else ''
+        print(json.dumps({
+            'app': parts[0],
+            'title': title,
+            'visible_apps': parts[2]
+        }, ensure_ascii=False))
+    else:
+        print(json.dumps({'error': 'Parse failed'}))
+"

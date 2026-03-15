@@ -239,7 +239,7 @@ The daily log (`YYYY-MM-DD.json`) includes an enhanced `summary` object for Chie
     "calendar_events": [{"summary": "Alex <> Peter", "start": "10:00", "end": "11:00", "calendar": "meetings"}],
     "agent_sessions": {"chat_count": 12, "by_project": {"Skills (day-tracker)": {"type": "tools", "chat_count": 3}}},
     "google_docs_edited": [{"title": "W11 plan", "modified_time": "...", "id": "abc123"}],
-    "emails_sent": [{"to": "alex@...", "subject": "Re: Monday", "timestamp": "09:45", "account": "pete.hartree@gmail.com"}],
+    "emails_sent": [{"to": "alex@...", "subject": "Re: Monday", "timestamp": "09:45", "account": "your-email@gmail.com"}],
     "todoist_completed": [],
     "_errors": []
   },

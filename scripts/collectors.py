@@ -153,7 +153,7 @@ def collect_calendar_events(date_str: str) -> list[dict]:
         out = _run([
             "gog", "--json", "cal", "events", cal_id,
             "--from", date_str, "--to", date_str,
-            "--account", "pete.hartree@gmail.com",
+            "--account", "your-email@gmail.com",
             "--max", "50", "--results-only",
         ])
         if not out:
@@ -491,12 +491,12 @@ def _collect_google_docs_via_gog(date_str: str) -> list[dict]:
         f"modifiedTime > '{date_str}T00:00:00' and "
         f"modifiedTime < '{date_str}T23:59:59' and "
         "mimeType='application/vnd.google-apps.document' and "
-        "'pete.hartree@gmail.com' in writers"
+        "'your-email@gmail.com' in writers"
     )
     out = _run([
         "gog", "--json", "drive", "search", query,
         "--raw-query",
-        "--account", "pete.hartree@gmail.com",
+        "--account", "your-email@gmail.com",
         "--max", "50", "--results-only",
     ])
     if not out:
@@ -590,9 +590,9 @@ def collect_emails_sent(date_str: str) -> list[dict]:
     query = f"in:sent after:{search_date} before:{next_day}"
 
     accounts = [
-        "pete.hartree@gmail.com",
-        "peter@type3.audio",
-        "inboxwhenready@gmail.com",
+        "your-email@gmail.com",
+        "your-email@example.com",
+        "your-product@gmail.com",
     ]
 
     emails = []

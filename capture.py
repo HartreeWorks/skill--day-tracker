@@ -22,6 +22,20 @@ from config import load_config, CAPTURES_DIR, DAILY_DIR, REFERENCE_WALLPAPERS_DI
 from models import CaptureMetadata, ActiveWindow, Analysis, DailyLog
 from logging_config import log_capture_event, rotate_logs
 
+FOCUS_LOG_DIR = Path.home() / "Documents" / "day-tracker" / "data" / "focus-log"
+
+
+def is_screen_locked() -> bool:
+    """Check if the screen is locked."""
+    try:
+        import Quartz
+        session = Quartz.CGSessionCopyCurrentDictionary()
+        if session:
+            return bool(session.get("CGSSessionScreenIsLocked", False))
+    except Exception:
+        pass
+    return False
+
 
 def is_display_off() -> bool:
     """
@@ -192,41 +206,58 @@ def is_blank_desktop(screenshot_path: Path, screen_number: int, threshold: float
     if threshold <= 0:
         return False  # Feature disabled
 
-    # Check if reference wallpaper exists
-    reference_path = REFERENCE_WALLPAPERS_DIR / f"screen-{screen_number}-wallpaper.jpg"
-    if not reference_path.exists():
+    # Find reference wallpaper thumbnails — supports multiple per screen (e.g. portrait + landscape)
+    # Thumbnails are pre-cropped and pre-resized to 100x100 for fast comparison
+    reference_paths = sorted(REFERENCE_WALLPAPERS_DIR.glob(f"screen-{screen_number}-wallpaper*-thumb.webp"))
+    if not reference_paths:
+        # Fall back to full-size references (legacy or non-thumb)
+        reference_paths = sorted(REFERENCE_WALLPAPERS_DIR.glob(f"screen-{screen_number}-wallpaper*.webp"))
+        # Exclude thumb files if we somehow matched them
+        reference_paths = [p for p in reference_paths if '-thumb' not in p.name]
+    if not reference_paths:
         return False  # No reference to compare against
 
     try:
         from PIL import Image
         import numpy as np
 
-        # Load images
+        # Load screenshot and crop edges (menu bar top, shadow edges)
+        crop_edge = 30  # pixels to crop from left/right/bottom edges (shadow)
         screenshot = Image.open(screenshot_path).convert('RGB')
-        reference = Image.open(reference_path).convert('RGB')
+        screenshot = screenshot.crop((
+            crop_edge, crop_top,
+            screenshot.width - crop_edge, screenshot.height - crop_edge
+        ))
 
-        # Crop top portion (menu bar with clock/status that changes)
-        if crop_top > 0:
-            screenshot = screenshot.crop((0, crop_top, screenshot.width, screenshot.height))
-            reference = reference.crop((0, crop_top, reference.width, reference.height))
-
-        # Resize both to same small size for fast comparison
         sample_size = 100
         screenshot = screenshot.resize((sample_size, sample_size), Image.LANCZOS)
-        reference = reference.resize((sample_size, sample_size), Image.LANCZOS)
 
-        # Convert to numpy arrays
-        arr1 = np.array(screenshot)
-        arr2 = np.array(reference)
+        # Try each reference — match if ANY reference is close enough
+        # References are stored pre-cropped and pre-resized to 100x100
+        for reference_path in reference_paths:
+            reference = Image.open(reference_path).convert('RGB')
+            if reference.size != (sample_size, sample_size):
+                reference = reference.crop((
+                    crop_edge, crop_top,
+                    reference.width - crop_edge, reference.height - crop_edge
+                ))
+                reference = reference.resize((sample_size, sample_size), Image.LANCZOS)
 
-        # Calculate difference (same logic as calculate_image_difference)
-        color_threshold = 30  # Allow small color variations
-        diff = np.abs(arr1.astype(int) - arr2.astype(int))
-        changed_pixels = np.any(diff > color_threshold, axis=2)
-        difference = float(np.mean(changed_pixels))
+            # Convert to numpy arrays
+            arr1 = np.array(screenshot)
+            arr2 = np.array(reference)
 
-        # If difference is less than threshold, it's a blank desktop
-        return difference < threshold
+            # Calculate difference (same logic as calculate_image_difference)
+            color_threshold = 30  # Allow small color variations
+            diff = np.abs(arr1.astype(int) - arr2.astype(int))
+            changed_pixels = np.any(diff > color_threshold, axis=2)
+            difference = float(np.mean(changed_pixels))
+
+            # If difference is less than threshold, it's a blank desktop
+            if difference < threshold:
+                return True
+
+        return False
 
     except Exception as e:
         print(f"Blank desktop check failed: {e}")
@@ -248,9 +279,9 @@ def get_screen_count() -> int:
         return 1
 
 
-def capture_screenshots(output_dir: Path, quality: int = 70) -> List[str]:
+def capture_screenshots(output_dir: Path, quality: int = 60) -> List[str]:
     """
-    Capture all screens and save as JPEGs.
+    Capture all screens and save as WebP.
 
     Returns list of filenames.
     """
@@ -259,25 +290,29 @@ def capture_screenshots(output_dir: Path, quality: int = 70) -> List[str]:
     screen_count = get_screen_count()
 
     for i in range(1, screen_count + 1):
-        filename = f"screen-{i}.jpg"
+        filename = f"screen-{i}.webp"
+        # Capture as PNG first (lossless source for best quality downscale)
+        tmp_filepath = output_dir / f"screen-{i}.png"
         filepath = output_dir / filename
 
         # -x: silent (no sound)
-        # -t jpg: JPEG format
+        # -t png: lossless capture
         # -D: display number (1-indexed)
         result = subprocess.run(
-            ["screencapture", "-x", "-t", "jpg", "-D", str(i), str(filepath)],
+            ["screencapture", "-x", "-t", "png", "-D", str(i), str(tmp_filepath)],
             capture_output=True
         )
 
-        if filepath.exists():
+        if tmp_filepath.exists():
             filenames.append(filename)
 
-            # Scale to 75% and compress using PIL
-            img = Image.open(filepath)
-            new_size = (int(img.width * 0.75), int(img.height * 0.75))
+            # Scale to 50% and compress to WebP
+            img = Image.open(tmp_filepath)
+            new_size = (int(img.width * 0.50), int(img.height * 0.50))
             img = img.resize(new_size, Image.LANCZOS)
-            img.save(filepath, "JPEG", quality=quality)
+            img.save(filepath, "WebP", quality=quality)
+            img.close()
+            tmp_filepath.unlink()
 
     return filenames
 
@@ -286,10 +321,29 @@ def capture_screenshots(output_dir: Path, quality: int = 70) -> List[str]:
 HELPER_APP = Path(__file__).parent / "DayTrackerHelper.app" / "Contents" / "MacOS" / "get-window-info"
 
 
+def get_frontmost_window_title() -> str:
+    """Get the title of the frontmost window using Quartz (works under launchd)."""
+    try:
+        import Quartz
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID
+        )
+        if windows:
+            # First on-screen window at layer 0 is typically the frontmost app window
+            for win in windows:
+                if win.get("kCGWindowLayer", 999) == 0 and win.get("kCGWindowName"):
+                    return win["kCGWindowName"]
+    except Exception:
+        pass
+    return ""
+
+
 def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
     """
     Get active window and visible apps using the helper app.
     The helper app has its own Accessibility permissions, keeping Python unprivileged.
+    Window title is supplemented via Quartz (works under launchd where AppleScript can't).
     """
     try:
         result = subprocess.run(
@@ -309,9 +363,14 @@ def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
             # Parse active window
             active_window = None
             if data.get("app"):
+                title = data.get("title", "")
+                # If AppleScript couldn't get the title (common under launchd),
+                # fall back to Quartz CGWindowList
+                if not title:
+                    title = get_frontmost_window_title()
                 active_window = ActiveWindow(
                     app=data.get("app", ""),
-                    title=data.get("title", "")
+                    title=title
                 )
 
             # Parse visible apps
@@ -343,6 +402,66 @@ def get_visible_apps() -> List[str]:
     return visible_apps
 
 
+def get_focus_history(minutes: int = 2) -> Optional[List[dict]]:
+    """Read recent focus log entries and compute time-per-window percentages.
+
+    Returns a list sorted by percentage descending:
+        [{"app": "Google Chrome", "title": "AI Wow draft", "pct": 72}, ...]
+    Returns None if no focus log data is available.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = FOCUS_LOG_DIR / f"{today}.jsonl"
+    if not log_path.exists():
+        return None
+
+    now = datetime.now()
+    cutoff = now - __import__("datetime").timedelta(minutes=minutes)
+
+    # Read entries within the time window
+    entries = []
+    try:
+        with open(log_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    t = datetime.strptime(entry["t"], "%Y-%m-%dT%H:%M:%S")
+                    if t >= cutoff:
+                        entries.append((t, entry["app"], entry.get("title", "")))
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+    except Exception:
+        return None
+
+    if not entries:
+        return None
+
+    # Compute duration for each entry (time until next entry; last runs until now)
+    durations = {}  # (app, title) -> total seconds
+    for i, (t, app, title) in enumerate(entries):
+        if i + 1 < len(entries):
+            duration = (entries[i + 1][0] - t).total_seconds()
+        else:
+            duration = (now - t).total_seconds()
+        key = (app, title)
+        durations[key] = durations.get(key, 0) + duration
+
+    total = sum(durations.values())
+    if total <= 0:
+        return None
+
+    result = []
+    for (app, title), secs in durations.items():
+        pct = round(secs / total * 100)
+        if pct > 0:
+            result.append({"app": app, "title": title, "pct": pct})
+
+    result.sort(key=lambda x: x["pct"], reverse=True)
+    return result if result else None
+
+
 def check_sensitive_window(active_window: Optional[ActiveWindow], config: CaptureConfig) -> bool:
     """Check if current window matches sensitive patterns (pre-filter)."""
     if not active_window:
@@ -355,6 +474,210 @@ def check_sensitive_window(active_window: Optional[ActiveWindow], config: Captur
             return True
 
     return False
+
+
+def check_skip_window(active_window: Optional[ActiveWindow], config: CaptureConfig) -> bool:
+    """Check if current app matches skip_window_patterns (video/entertainment apps)."""
+    if not active_window or not config.skip_window_patterns:
+        return False
+    app_lower = active_window.app.lower()
+    for pattern in config.skip_window_patterns:
+        if pattern.lower() == app_lower:
+            return True
+    return False
+
+
+def apply_app_rules(active_window: Optional[ActiveWindow], analysis: 'Analysis', config: CaptureConfig):
+    """Apply deterministic app rules to override AI inference. Mutates analysis in place."""
+    if not active_window or not config.app_rules:
+        return
+    app_lower = active_window.app.lower()
+    title_lower = active_window.title.lower()
+    for rule in config.app_rules:
+        if rule.get("app", "").lower() != app_lower:
+            continue
+        title_contains = rule.get("title_contains", "")
+        if title_contains and title_contains.lower() not in title_lower:
+            continue
+        # First match wins — apply overrides
+        if "category" in rule:
+            analysis.category = rule["category"]
+        if "project" in rule:
+            analysis.inferred_project = rule["project"]
+            analysis.project_confidence = 1.0
+        if "is_work" in rule:
+            analysis.is_work = rule["is_work"]
+        return
+
+
+def get_active_agent_sessions(recency_minutes: int = 5) -> List[dict]:
+    """Find recently active agent sessions (Claude Code and Codex).
+
+    Returns list of dicts sorted by recency, each with keys:
+        agent: "claude" or "codex"
+        title: session title (from title cache) or first user message (truncated)
+        project_path: filesystem path of the project (or None)
+    """
+    import time
+    from pathlib import Path
+
+    now = time.time()
+    cutoff = now - (recency_minutes * 60)
+
+    # Title cache
+    title_cache = {}
+    title_cache_path = Path.home() / ".claude" / "conversation-titles.json"
+    try:
+        with open(title_cache_path) as f:
+            title_cache = json.load(f)
+    except Exception:
+        pass
+
+    # Known projects for Claude directory decoding
+    from config import load_known_projects, PROJECTS_YAML
+    known_projects = []
+    if PROJECTS_YAML.exists():
+        try:
+            import yaml
+            with open(PROJECTS_YAML) as f:
+                data = yaml.safe_load(f)
+            known_projects = data.get("projects", [])
+        except Exception:
+            pass
+
+    # Collect all recent session files with mtime
+    candidates = []  # (mtime, agent, session_id, project_path, jsonl_path)
+
+    # Claude sessions: ~/.claude/projects/<encoded-path>/<UUID>.jsonl
+    claude_projects_dir = Path.home() / ".claude" / "projects"
+    if claude_projects_dir.exists():
+        for jsonl_file in claude_projects_dir.glob("*/*.jsonl"):
+            try:
+                mtime = jsonl_file.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            session_id = jsonl_file.stem
+            dir_name = jsonl_file.parent.name
+            project_path = _decode_claude_project_dir(dir_name, known_projects)
+            candidates.append((mtime, "claude", session_id, project_path, jsonl_file))
+
+    # Codex sessions: ~/.codex/sessions/YYYY/MM/DD/rollout-<datetime>-<UUID>.jsonl
+    codex_sessions_dir = Path.home() / ".codex" / "sessions"
+    if codex_sessions_dir.exists():
+        for jsonl_file in codex_sessions_dir.glob("*/*/*/**.jsonl"):
+            try:
+                mtime = jsonl_file.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            match = re.match(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.*)", jsonl_file.stem)
+            if not match:
+                continue
+            session_id = match.group(1)
+            # Extract project path from first line (session_meta)
+            project_path = _get_codex_project_path(jsonl_file)
+            candidates.append((mtime, "codex", session_id, project_path, jsonl_file))
+
+    # Sort by mtime descending (most recent first)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    results = []
+    for mtime, agent, session_id, project_path, jsonl_path in candidates:
+        # Look up title
+        cache_key = f"{agent}:{session_id}"
+        cached = title_cache.get(cache_key, {})
+        title = cached.get("title") if isinstance(cached, dict) else None
+
+        # Fallback: first user message
+        if not title:
+            title = _get_first_user_message(jsonl_path)
+
+        if not title:
+            continue  # Skip sessions with no identifiable content
+
+        results.append({
+            "agent": agent,
+            "title": title,
+            "project_path": project_path,
+        })
+
+    return results
+
+
+def _decode_claude_project_dir(dir_name: str, known_projects: list) -> Optional[str]:
+    """Match an encoded Claude project directory to a known project path.
+
+    First tries matching against known projects from projects.yaml.
+    Falls back to scanning the actual ~/.claude/projects/ directory structure
+    to reverse the encoding.
+    """
+    # Try known projects first (most common)
+    for project in known_projects:
+        folder = project.get("folder", "")
+        if not folder:
+            continue
+        for base in ["/Users/ph/Documents/Projects/", "/Users/ph/.agents/skills/",
+                     "/Users/ph/Documents/www/", "/Users/ph/"]:
+            full_path = base + folder
+            encoded = full_path.replace("/", "-").replace(".", "-")
+            if dir_name == encoded or dir_name.startswith(encoded):
+                return full_path
+
+    # Fallback: try to reverse-decode the directory name by testing known filesystem paths
+    # The encoding is: replace / with - and . with -
+    # We can't perfectly reverse this, but we can try common parent directories
+    home = str(Path.home())
+    common_bases = [
+        home + "/Documents/Projects",
+        home + "/Documents/www",
+        home + "/.agents/skills",
+        home + "/.agents",
+        home,
+    ]
+    for base in common_bases:
+        encoded_base = base.replace("/", "-").replace(".", "-")
+        if dir_name.startswith(encoded_base):
+            # The remainder after the base is the project-specific part
+            # Return the base path (best we can do without exact reversal)
+            return base
+    return None
+
+
+def _get_codex_project_path(jsonl_path: Path) -> Optional[str]:
+    """Extract project working directory from Codex session first line."""
+    try:
+        with open(jsonl_path) as f:
+            first_line = f.readline()
+        entry = json.loads(first_line)
+        if entry.get("type") == "session_meta":
+            return entry.get("payload", {}).get("cwd")
+    except Exception:
+        pass
+    return None
+
+
+def _get_first_user_message(jsonl_path: Path, max_lines: int = 20) -> Optional[str]:
+    """Read the first user message from a session JSONL file."""
+    try:
+        with open(jsonl_path) as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") == "user":
+                    content = entry.get("content", "")
+                    if isinstance(content, list):
+                        content = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                    return content[:200] if content else None
+    except Exception:
+        pass
+    return None
 
 
 def match_project(active_window: Optional[ActiveWindow], visible_apps: List[str], config: CaptureConfig) -> Optional[str]:
@@ -453,6 +776,16 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         print("Display is off, skipping capture.")
         return None
 
+    # Check if screen is locked
+    if is_screen_locked():
+        log_capture_event(
+            "skipped_locked",
+            "Capture skipped: screen locked",
+            reason="Screen is locked"
+        )
+        print("Screen is locked, skipping capture.")
+        return None
+
     # Get active window info first (for pre-filtering)
     # Use get_window_info() once to get both values efficiently
     active_window, visible_apps = get_window_info()
@@ -468,6 +801,39 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         )
         print(f"Sensitive window detected ({app_name}), skipping capture.")
         return None
+
+    # Check for video/entertainment apps — log minimal entry, skip screenshots and Gemini
+    if check_skip_window(active_window, config):
+        app_name = active_window.app if active_window else "unknown"
+        log_capture_event(
+            "skipped_entertainment",
+            f"Capture skipped: entertainment app ({app_name})",
+            reason="Skip window pattern matched",
+            details={"app": app_name}
+        )
+        print(f"Entertainment app detected ({app_name}), logging minimal entry.")
+
+        # Create a minimal entry with no screenshots or AI call
+        capture_dir, timestamp = get_capture_dir()
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        analysis = Analysis(
+            description=f"Watching/using {app_name}",
+            category="entertainment",
+            oneline=f"Using {app_name}",
+            is_work=False,
+            inferred_project=None,
+        )
+        metadata = CaptureMetadata(
+            timestamp=timestamp,
+            screens=[],
+            active_window=active_window,
+            visible_apps=visible_apps,
+            analysis=analysis,
+            auto_project=None,
+        )
+        metadata.save(capture_dir / "metadata.json")
+        update_daily_log(metadata, capture_dir)
+        return metadata
 
     # Set up capture directory
     capture_dir, timestamp = get_capture_dir()
@@ -512,7 +878,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         else:
             # Some screens black - remove them from the list
             for screen_num in black_screens:
-                screenshot = f"screen-{screen_num}.jpg"
+                screenshot = f"screen-{screen_num}.webp"
                 if screenshot in screenshots:
                     screenshots.remove(screenshot)
                     (capture_dir / screenshot).unlink(missing_ok=True)
@@ -544,12 +910,12 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         from PIL import Image
         active_screenshots = []
         for screenshot in screenshots:
-            # Extract screen number: "screen-2.jpg" -> 2
+            # Extract screen number: "screen-2.webp" -> 2
             screen_num = int(screenshot.split("-")[1].split(".")[0])
             screenshot_path = capture_dir / screenshot
             if is_blank_desktop(screenshot_path, screen_num, config.blank_desktop_threshold, config.blank_desktop_crop_top):
                 # Resize to thumbnail and rename with --blank suffix
-                blank_filename = f"screen-{screen_num}--blank.jpg"
+                blank_filename = f"screen-{screen_num}--blank.webp"
                 blank_path = capture_dir / blank_filename
                 try:
                     img = Image.open(screenshot_path)
@@ -557,7 +923,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
                     ratio = 300 / img.width
                     new_size = (300, int(img.height * ratio))
                     img_thumb = img.resize(new_size, Image.LANCZOS)
-                    img_thumb.save(blank_path, "JPEG", quality=70)
+                    img_thumb.save(blank_path, "WebP", quality=60)
                     img.close()
                     # Remove original full-size image
                     screenshot_path.unlink()
@@ -590,6 +956,22 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         # Use filtered list for analysis
         screenshots = active_screenshots
 
+    # Look up active agent sessions
+    active_sessions = None
+    try:
+        sessions = get_active_agent_sessions()
+        if sessions:
+            active_sessions = sessions
+    except Exception as e:
+        print(f"Agent session lookup failed: {e}")
+
+    # Get focus history from focus logger daemon
+    focus_history = None
+    try:
+        focus_history = get_focus_history(minutes=2)
+    except Exception as e:
+        print(f"Focus history lookup failed: {e}")
+
     # Auto-detect project
     auto_project = match_project(active_window, visible_apps, config)
 
@@ -600,15 +982,21 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         active_window=active_window,
         visible_apps=visible_apps,
         auto_project=auto_project,
-        excluded_blank_screens=excluded_blank_screens
+        excluded_blank_screens=excluded_blank_screens,
+        active_sessions=active_sessions,
+        focus_history=focus_history
     )
 
     # Analyze with Gemini (unless skipped)
     if not skip_analysis:
         try:
             from analyze import analyze_capture
-            analysis = analyze_capture(capture_dir, screenshots, active_window, visible_apps, config)
+            analysis = analyze_capture(capture_dir, screenshots, active_window, visible_apps, config, session_context=active_sessions, focus_history=focus_history)
             metadata.analysis = analysis
+
+            # Apply deterministic app rules (override AI inference)
+            if analysis:
+                apply_app_rules(active_window, analysis, config)
 
             if analysis:
                 log_capture_event(

@@ -29,21 +29,27 @@ python3 ~/.claude/skills/day-tracker/server.py
 
 ## Scheduled Capture
 
-The capture runs every 2 minutes via the `schedule-task` skill:
+The capture runs every 2 minutes via a launchd agent (`com.ph.daytracker.v2`):
 
 ```bash
 # View status
-python3 ~/.claude/skills/schedule-task/scripts/scheduler.py list
-
-# Disable temporarily
-python3 ~/.claude/skills/schedule-task/scripts/scheduler.py disable --name day-tracker-capture
-
-# Re-enable
-python3 ~/.claude/skills/schedule-task/scripts/scheduler.py enable --name day-tracker-capture
+launchctl print gui/$(id -u)/com.ph.daytracker.v2
 
 # View logs
-cat /tmp/claude-scheduled-day-tracker-capture.log
+cat ~/Documents/day-tracker/data/logs/launchd.log
+
+# Disable temporarily
+launchctl bootout gui/$(id -u)/com.ph.daytracker.v2
+
+# Re-enable
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ph.daytracker.v2.plist
+
+# Force an immediate run
+launchctl kickstart gui/$(id -u)/com.ph.daytracker.v2
 ```
+
+Plist: `~/Library/LaunchAgents/com.ph.daytracker.v2.plist`
+Wrapper: `~/.claude/skills/day-tracker/capture-launchd.py` (calls `run_capture()` directly; `capture.py`'s `main()` exits with code 78 under launchd for unknown reasons).
 
 ## macOS Permissions
 
@@ -98,8 +104,22 @@ The daily rollup (`scripts/daily-rollup.py`) post-processes raw daily JSON:
 * **Project consolidation** — maps `inferred_project` to canonical names from `projects.yaml` via fuzzy matching
 * **Gap filling** — attributes unclassified entries between same-project entries (within 15-min window)
 * **Summary generation** — populates the `summary` field with time breakdowns by project and category
+* **Completion signals** — collects "what happened today" data from external sources into `completions`
 
-Runs at 23:55 daily via `schedule-task`. Idempotent — safe to re-run.
+Runs at 23:55 daily via launchd (`com.ph.daytracker.rollup`). Idempotent — safe to re-run.
+
+#### Completion data sources
+
+| Source | CLI dependency | What it collects |
+|--------|---------------|------------------|
+| Git commits | `git` | All commits across `~/Documents` repos + `~/.agents` |
+| Calendar events | `gog` | Both primary and meetings calendars, deduplicated |
+| Agent sessions | — | Claude Code + Codex sessions (JSONL scan + day-tracker) |
+| Google Docs edited | `gog` | Docs modified on the target date |
+| Emails sent | `gog` | Sent emails across all 3 Gmail accounts |
+| Todoist completed | `td` | Stub — `td` CLI not yet installed |
+
+Collector errors are logged to stderr and sent as warnings to the hartreeworks.org alerts API (requires `HARTREEWORKS_INTERNAL_API_KEY` env var).
 
 ### Weekly digest
 
@@ -214,21 +234,25 @@ The daily log (`YYYY-MM-DD.json`) includes an enhanced `summary` object for Chie
 {
   "date": "2026-01-16",
   "entries": [...],
+  "completions": {
+    "git_commits": [{"repo": "ai-wow", "message": "Fix nav", "timestamp": "14:32", "author": "Peter Hartree"}],
+    "calendar_events": [{"summary": "Alex <> Peter", "start": "10:00", "end": "11:00", "calendar": "meetings"}],
+    "agent_sessions": {"chat_count": 12, "by_project": {"Skills (day-tracker)": {"type": "tools", "chat_count": 3}}},
+    "google_docs_edited": [{"title": "W11 plan", "modified_time": "...", "id": "abc123"}],
+    "emails_sent": [{"to": "alex@...", "subject": "Re: Monday", "timestamp": "09:45", "account": "pete.hartree@gmail.com"}],
+    "todoist_completed": [],
+    "_errors": []
+  },
   "summary": {
     "total_tracked_minutes": 480,
     "work_minutes": 420,
     "personal_minutes": 60,
-    "by_project": {
-      "website-redesign": 180,
-      "api-integration": 120
-    },
-    "by_category": {
-      "coding": 240,
-      "meetings": 90,
-      "communication": 60
-    },
-    "people_interacted": ["Alice Smith", "Bob Jones"],
-    "organizations_touched": ["Acme Corp", "Example Inc"]
+    "by_project": {"website-redesign": 180, "api-integration": 120},
+    "by_category": {"coding": 240, "meetings": 90, "communication": 60},
+    "git_commit_count": 8,
+    "agent_session_count": 12,
+    "calendar_event_count": 3,
+    "emails_sent_count": 2
   }
 }
 ```

@@ -28,12 +28,12 @@ end try
 APPLESCRIPT
 )
 
-# Use Python to safely encode as JSON (handles Unicode properly)
-/usr/bin/python3 -c "
+# Pipe raw data to Python via stdin to avoid shell interpolation issues
+echo "$RAW" | /usr/bin/python3 -c "
 import json
 import sys
 
-raw = '''$RAW'''
+raw = sys.stdin.read().strip()
 
 if raw.startswith('<<<ERROR>>>'):
     print(json.dumps({'error': raw[11:]}))

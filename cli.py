@@ -362,11 +362,14 @@ def cmd_capture_wallpaper(args):
 
         # Copy to reference directory with correct naming
         for screenshot in screenshots:
-            screen_num = screenshot.split("-")[1].split(".")[0]  # "screen-2.jpg" -> "2"
+            screen_num = screenshot.split("-")[1].split(".")[0]  # "screen-2.webp" -> "2"
             src = tmpdir / screenshot
             dst = REFERENCE_WALLPAPERS_DIR / f"screen-{screen_num}-wallpaper.jpg"
-
-            shutil.copy2(src, dst)
+            # Convert webp capture to jpg for reference wallpaper storage
+            from PIL import Image as PILImage
+            img = PILImage.open(src)
+            img.save(dst, "JPEG", quality=90)
+            img.close()
             print(f"  Saved: {dst.name}")
 
     print()

@@ -77,6 +77,53 @@ def load_daily_data(date):
     return dict(by_project), num_entries, num_entries < LOW_DATA_THRESHOLD
 
 
+def load_daily_completions(date):
+    """Load completions sidecar for a date. Returns dict or empty dict."""
+    date_str = date.strftime("%Y-%m-%d")
+    completions_file = DAILY_DIR / f"{date_str}.completions.json"
+    if not completions_file.exists():
+        return {}
+    try:
+        with open(completions_file) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def aggregate_completions(week_completions):
+    """Aggregate completions across days into week totals."""
+    from collections import Counter
+    totals = {
+        "git_commits_by_repo": Counter(),
+        "git_commit_count": 0,
+        "agent_session_count": 0,
+        "calendar_event_count": 0,
+        "emails_sent_count": 0,
+        "google_docs_edited": [],
+        "google_docs_edited_count": 0,
+    }
+    seen_doc_ids = set()
+
+    for c in week_completions:
+        if not c:
+            continue
+        for commit in c.get("git_commits", []):
+            if isinstance(commit, dict) and "repo" in commit:
+                totals["git_commits_by_repo"][commit["repo"]] += 1
+                totals["git_commit_count"] += 1
+        totals["agent_session_count"] += c.get("agent_sessions", {}).get("chat_count", 0)
+        totals["calendar_event_count"] += len(c.get("calendar_events", []))
+        totals["emails_sent_count"] += len(c.get("emails_sent", []))
+        for doc in c.get("google_docs_edited", []):
+            doc_id = doc.get("id", "")
+            if doc_id and doc_id not in seen_doc_ids:
+                seen_doc_ids.add(doc_id)
+                totals["google_docs_edited"].append(doc.get("title", ""))
+                totals["google_docs_edited_count"] += 1
+
+    return totals
+
+
 def format_hours(minutes):
     """Format minutes as ~Nh string."""
     if minutes == 0:
@@ -87,7 +134,7 @@ def format_hours(minutes):
     return f"~{hours:.0f}h"
 
 
-def render_table(week_str, monday, days_data, project_names, notes):
+def render_table(week_str, monday, days_data, project_names, notes, comp_totals=None):
     """Render a human-readable table."""
     sunday = monday + timedelta(days=6)
     mon_str = monday.strftime("%a %d %b")
@@ -155,6 +202,21 @@ def render_table(week_str, monday, days_data, project_names, notes):
     total_row += f"  {format_hours(grand_total):>{col_width}}"
     lines.append(total_row)
 
+    # Completions summary
+    if comp_totals and comp_totals.get("git_commit_count", 0) > 0:
+        lines.append("")
+        lines.append("Completions:")
+        lines.append(f"  Git commits: {comp_totals['git_commit_count']}")
+        for repo, count in comp_totals["git_commits_by_repo"].most_common():
+            lines.append(f"    {repo}: {count}")
+        lines.append(f"  Agent sessions: {comp_totals['agent_session_count']}")
+        lines.append(f"  Calendar events: {comp_totals['calendar_event_count']}")
+        lines.append(f"  Emails sent: {comp_totals['emails_sent_count']}")
+        if comp_totals["google_docs_edited_count"] > 0:
+            lines.append(f"  Google Docs edited: {comp_totals['google_docs_edited_count']}")
+            for title in comp_totals["google_docs_edited"]:
+                lines.append(f"    {title}")
+
     # Notes
     if notes:
         lines.append("")
@@ -165,7 +227,7 @@ def render_table(week_str, monday, days_data, project_names, notes):
     return "\n".join(lines)
 
 
-def render_json(week_str, monday, days_data, project_names, notes):
+def render_json(week_str, monday, days_data, project_names, notes, comp_totals=None):
     """Render structured JSON output."""
     result = {
         "week": week_str,
@@ -188,6 +250,16 @@ def render_json(week_str, monday, days_data, project_names, notes):
 
     for proj in all_projects:
         result["totals"][proj] = sum(d["by_project"].get(proj, 0) for d in days_data)
+
+    if comp_totals:
+        result["completions"] = {
+            "git_commit_count": comp_totals.get("git_commit_count", 0),
+            "git_commits_by_repo": dict(comp_totals.get("git_commits_by_repo", {})),
+            "agent_session_count": comp_totals.get("agent_session_count", 0),
+            "calendar_event_count": comp_totals.get("calendar_event_count", 0),
+            "emails_sent_count": comp_totals.get("emails_sent_count", 0),
+            "google_docs_edited": comp_totals.get("google_docs_edited", []),
+        }
 
     return json.dumps(result, indent=2)
 
@@ -219,6 +291,7 @@ def main():
     project_names["unclassified"] = "Unclassified"
 
     days_data = []
+    week_completions = []
     notes = []
 
     current = monday
@@ -230,6 +303,8 @@ def main():
             "num_entries": num_entries,
             "low_data": low_data,
         })
+        week_completions.append(load_daily_completions(current))
+
         if low_data and num_entries > 0:
             day_name = DAY_NAMES[current.weekday()]
             date_str = current.strftime("%d %b")
@@ -244,10 +319,12 @@ def main():
 
         current += timedelta(days=1)
 
+    comp_totals = aggregate_completions(week_completions)
+
     if args.json:
-        print(render_json(week_str, monday, days_data, project_names, notes))
+        print(render_json(week_str, monday, days_data, project_names, notes, comp_totals))
     else:
-        print(render_table(week_str, monday, days_data, project_names, notes))
+        print(render_table(week_str, monday, days_data, project_names, notes, comp_totals))
 
 
 if __name__ == "__main__":

@@ -53,12 +53,14 @@ def get_gemini_client():
 
 def load_image_as_base64(image_path: Path) -> str:
     """Load an image file and return as base64 data URI."""
+    ext = image_path.suffix.lower()
+    mime_type = {"webp": "image/webp", "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(ext.lstrip("."), "image/webp")
     with open(image_path, "rb") as f:
         data = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:image/jpeg;base64,{data}"
+    return f"data:{mime_type};base64,{data}"
 
 
-def build_prompt(active_window: Optional[ActiveWindow], visible_apps: List[str], categories: List[str], num_screens: int = 1, user_name: str = "") -> str:
+def build_prompt(active_window: Optional[ActiveWindow], visible_apps: List[str], categories: List[str], num_screens: int = 1, user_name: str = "", session_context: Optional[list] = None, focus_history: Optional[list] = None) -> str:
     """Build the analysis prompt."""
     context_parts = []
 
@@ -71,6 +73,27 @@ def build_prompt(active_window: Optional[ActiveWindow], visible_apps: List[str],
         context_parts.append(f"Visible Applications: {', '.join(visible_apps)}")
 
     context = "\n".join(context_parts) if context_parts else "No application context available."
+
+    # Build agent session context section
+    session_section = ""
+    if session_context:
+        session_lines = []
+        for i, s in enumerate(session_context):
+            agent = s.get("agent", "unknown").title()
+            title = s.get("title", "untitled")
+            project_path = s.get("project_path", "")
+            line = f"  {i+1}. [{agent}] \"{title}\""
+            if project_path:
+                line += f" (path: {project_path})"
+            session_lines.append(line)
+        session_section = f"""
+AGENT SESSION CONTEXT (the user is working in AI coding assistants):
+Recently active sessions (ordered by recency):
+{chr(10).join(session_lines)}
+Use this context to inform your project attribution and activity description.
+Session titles are reliable indicators of what the user is working on.
+"""
+
     categories_str = ", ".join(categories)
 
     # Build category descriptions with work/personal classification
@@ -82,13 +105,29 @@ CATEGORY GUIDANCE:
 - Personal categories: {', '.join(personal_categories)}
 - Use "other" only if none of the above fit"""
 
+    # Build focus history section
+    focus_section = ""
+    if focus_history:
+        focus_lines = []
+        for fh in focus_history:
+            title_part = f'"{fh["title"]}"' if fh.get("title") else "(no title)"
+            focus_lines.append(f'- {title_part} ({fh["app"]}): {fh["pct"]}%')
+        focus_section = f"""
+FOCUS HISTORY (which windows had keyboard/mouse focus in the last 2 minutes):
+{chr(10).join(focus_lines)}
+Weight your description toward the windows that had more focus time.
+"""
+
     # Multi-screen instruction
     screen_instruction = ""
     if num_screens > 1:
+        focus_ref = ""
+        if focus_history:
+            focus_ref = "\nUse the FOCUS HISTORY below to understand which content the user was actively working with.\nScreens showing apps that had no recent focus are likely background/reference material."
         screen_instruction = f"""
 IMPORTANT: You are viewing {num_screens} screenshots from different monitors.
 Describe the activity on ALL screens, not just the one with the active window.
-If a screen shows static content (desktop, unchanged app), note it briefly as "idle" or "background".
+If a screen shows static content (desktop, unchanged app), note it briefly as "idle" or "background".{focus_ref}
 """
 
     # Load known projects for context
@@ -108,7 +147,7 @@ KNOWN PROJECTS (use folder name for inferred_project if you can match the visibl
 {screen_instruction}
 APPLICATION CONTEXT:
 {context}
-{category_help}
+{session_section}{focus_section}{category_help}
 {projects_section}
 Provide a JSON response with these fields:
 
@@ -236,7 +275,9 @@ def analyze_capture(
     screenshots: List[str],
     active_window: Optional[ActiveWindow],
     visible_apps: List[str],
-    config: CaptureConfig
+    config: CaptureConfig,
+    session_context: Optional[list] = None,
+    focus_history: Optional[list] = None
 ) -> Optional[Analysis]:
     """
     Analyze screenshots using Gemini Flash.
@@ -247,6 +288,7 @@ def analyze_capture(
         active_window: Active window information
         visible_apps: List of visible applications
         config: Configuration
+        session_context: Active agent sessions list (from get_active_agent_sessions)
 
     Returns:
         Analysis object with results, or None if analysis failed
@@ -258,7 +300,7 @@ def analyze_capture(
         return None
 
     # Build prompt (pass number of screens for multi-monitor awareness)
-    prompt = build_prompt(active_window, visible_apps, config.categories, num_screens=len(screenshots), user_name=config.user_name)
+    prompt = build_prompt(active_window, visible_apps, config.categories, num_screens=len(screenshots), user_name=config.user_name, session_context=session_context, focus_history=focus_history)
 
     # Load images
     images = []

@@ -9,7 +9,8 @@ from typing import Optional
 from config import DATA_DIR
 
 # Log file location
-LOG_FILE = DATA_DIR / "capture.log"
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE = LOG_DIR / "capture.log"
 LOG_MAX_LINES = 1000  # Keep last N log entries
 
 

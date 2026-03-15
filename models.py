@@ -66,6 +66,8 @@ class CaptureMetadata:
     auto_project: Optional[str] = None
     manual_project: Optional[str] = None
     excluded_blank_screens: List[str] = field(default_factory=list)  # Screens excluded (wallpaper only)
+    active_sessions: Optional[List[dict]] = None  # Active agent sessions
+    focus_history: Optional[List[dict]] = None  # Focus history summary [{app, title, pct}]
 
     def to_dict(self) -> dict:
         d = {
@@ -78,6 +80,10 @@ class CaptureMetadata:
             "manual_project": self.manual_project,
             "excluded_blank_screens": self.excluded_blank_screens
         }
+        if self.active_sessions:
+            d["active_sessions"] = self.active_sessions
+        if self.focus_history:
+            d["focus_history"] = self.focus_history
         return d
 
     @classmethod
@@ -90,7 +96,9 @@ class CaptureMetadata:
             analysis=Analysis(**d["analysis"]) if d.get("analysis") else None,
             auto_project=d.get("auto_project"),
             manual_project=d.get("manual_project"),
-            excluded_blank_screens=d.get("excluded_blank_screens", [])
+            excluded_blank_screens=d.get("excluded_blank_screens", []),
+            active_sessions=d.get("active_sessions"),
+            focus_history=d.get("focus_history")
         )
 
     @property
@@ -121,6 +129,9 @@ class DailyEntry:
     sensitive: bool = False
     is_work: bool = True  # Work vs personal classification
     inferred_project: Optional[str] = None  # AI-inferred project from visible context
+    active_app: Optional[str] = None  # App name at capture time
+    window_title: Optional[str] = None  # Window title at capture time
+    active_sessions: Optional[List[dict]] = None  # Active agent sessions [{agent, title, project_path}]
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -144,9 +155,14 @@ class DailyLog:
 
     @classmethod
     def from_dict(cls, d: dict) -> "DailyLog":
+        known_fields = DailyEntry.__dataclass_fields__
+        entries = [
+            DailyEntry(**{k: v for k, v in e.items() if k in known_fields})
+            for e in d.get("entries", [])
+        ]
         return cls(
             date=d["date"],
-            entries=[DailyEntry(**e) for e in d.get("entries", [])],
+            entries=entries,
             summary=d.get("summary")
         )
 
@@ -174,6 +190,9 @@ class DailyLog:
             project=metadata.project,
             sensitive=metadata.analysis.sensitive,
             is_work=metadata.analysis.is_work,
-            inferred_project=metadata.analysis.inferred_project
+            inferred_project=metadata.analysis.inferred_project,
+            active_app=metadata.active_window.app if metadata.active_window else None,
+            window_title=metadata.active_window.title if metadata.active_window else None,
+            active_sessions=metadata.active_sessions
         )
         self.entries.append(entry)

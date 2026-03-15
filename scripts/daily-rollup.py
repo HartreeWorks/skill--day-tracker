@@ -14,11 +14,16 @@ Idempotent — safe to re-run.
 """
 
 import json
+import os
+import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
+
+# Allow imports from parent directory (for config module)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 DATA_DIR = Path.home() / "Documents" / "day-tracker" / "data"
 DAILY_DIR = DATA_DIR / "daily"
@@ -174,50 +179,182 @@ def compute_summary(entries):
     }
 
 
+def send_alert(severity: str, title: str, message: str) -> None:
+    """Send an alert to hartreeworks.org/api/alerts. Fails silently."""
+    api_key = os.environ.get("HARTREEWORKS_INTERNAL_API_KEY", "")
+    if not api_key:
+        print(f"Alert ({severity}): {title} — {message}", file=sys.stderr)
+        print("  (HARTREEWORKS_INTERNAL_API_KEY not set, alert not sent)", file=sys.stderr)
+        return
+    try:
+        payload = json.dumps({
+            "source": "day-tracker-rollup",
+            "severity": severity,
+            "title": title,
+            "message": message,
+        })
+        subprocess.run(
+            ["curl", "-s", "-X", "POST",
+             "https://hartreeworks.org/api/alerts",
+             "-H", "Content-Type: application/json",
+             "-H", f"x-api-key: {api_key}",
+             "-d", payload],
+            capture_output=True, timeout=10,
+        )
+    except Exception as e:
+        print(f"Alert delivery failed: {e}", file=sys.stderr)
+
+
 def run_rollup(date_str):
-    """Run the daily rollup for a given date."""
+    """Run the daily rollup for a given date.
+
+    Processes screenshot entries if available (project mapping, gap filling,
+    summary). Always runs completion collectors and writes the sidecar file,
+    even on days with no screenshot data.
+    """
     daily_file = DAILY_DIR / f"{date_str}.json"
-    if not daily_file.exists():
-        print(f"No daily file found for {date_str}")
-        return False
+    has_entries = False
 
-    with open(daily_file) as f:
-        data = json.load(f)
+    if daily_file.exists():
+        with open(daily_file) as f:
+            data = json.load(f)
+        entries = data.get("entries", [])
+        has_entries = len(entries) > 0
+    else:
+        data = {"date": date_str, "entries": []}
+        entries = []
 
-    entries = data.get("entries", [])
-    if not entries:
-        print(f"No entries for {date_str}")
-        return False
+    # Process screenshot entries if present
+    if has_entries:
+        projects = load_projects()
+        alias_map = build_alias_map(projects)
 
-    # Load projects and build alias map
-    projects = load_projects()
-    alias_map = build_alias_map(projects)
+        for entry in entries:
+            inferred = entry.get("inferred_project")
+            canonical, confidence = fuzzy_match_project(inferred, alias_map, projects)
+            entry["canonical_project"] = canonical
 
-    # Step 1: Map inferred_project to canonical_project
-    for entry in entries:
-        inferred = entry.get("inferred_project")
-        canonical, confidence = fuzzy_match_project(inferred, alias_map, projects)
-        entry["canonical_project"] = canonical
+        try:
+            from config import load_config
+            config = load_config()
+            for entry in entries:
+                active_app = entry.get("active_app")
+                if not active_app or not config.app_rules:
+                    continue
+                app_lower = active_app.lower()
+                title_lower = (entry.get("window_title") or "").lower()
+                for rule in config.app_rules:
+                    if rule.get("app", "").lower() != app_lower:
+                        continue
+                    title_contains = rule.get("title_contains", "")
+                    if title_contains and title_contains.lower() not in title_lower:
+                        continue
+                    if "category" in rule:
+                        entry["category"] = rule["category"]
+                    if "project" in rule:
+                        entry["canonical_project"] = rule["project"]
+                    if "is_work" in rule:
+                        entry["is_work"] = rule["is_work"]
+                    break
+        except Exception as e:
+            print(f"Warning: Could not apply app_rules: {e}")
 
-    # Step 2: Fill gaps
-    fill_gaps(entries)
+        fill_gaps(entries)
+        summary = compute_summary(entries)
+    else:
+        summary = {
+            "total_tracked_minutes": 0,
+            "work_minutes": 0,
+            "personal_minutes": 0,
+            "by_project": {},
+            "by_category": {},
+            "low_data": True,
+            "rollup_timestamp": datetime.now().isoformat(),
+        }
 
-    # Step 3: Compute summary
-    data["summary"] = compute_summary(entries)
+    # Always collect completion signals
+    from collectors import collect_all
+    completions = collect_all(date_str)
+
+    # Add completion counts to summary
+    git_commits = completions.get("git_commits", [])
+    summary["git_commit_count"] = len([c for c in git_commits if isinstance(c, dict) and "repo" in c])
+
+    agent_sessions = completions.get("agent_sessions", {})
+    summary["agent_session_count"] = agent_sessions.get("chat_count", 0)
+
+    calendar_events = completions.get("calendar_events", [])
+    summary["calendar_event_count"] = len(calendar_events)
+
+    emails_sent = completions.get("emails_sent", [])
+    summary["emails_sent_count"] = len(emails_sent)
+
+    google_docs = completions.get("google_docs_edited", [])
+    summary["google_docs_edited_count"] = len(google_docs)
+
+    # Remove old inline completions if present (migration from v1)
+    data.pop("completions", None)
+
+    data["summary"] = summary
     data["entries"] = entries
 
-    # Write back
+    # Write main daily file (entries + summary only)
     with open(daily_file, "w") as f:
         json.dump(data, f, indent=2)
 
-    summary = data["summary"]
+    # Write completions to sidecar file
+    completions_file = DAILY_DIR / f"{date_str}.completions.json"
+    with open(completions_file, "w") as f:
+        json.dump(completions, f, indent=2)
+
     print(f"Rollup complete for {date_str}:")
-    print(f"  Entries: {len(entries)}")
-    print(f"  Total: {summary['total_tracked_minutes']}min")
-    print(f"  Work: {summary['work_minutes']}min, Personal: {summary['personal_minutes']}min")
-    print(f"  Projects: {len(summary['by_project'])}")
-    if summary["low_data"]:
-        print(f"  ⚠ Low data ({len(entries)} captures < {LOW_DATA_THRESHOLD})")
+    if has_entries:
+        print(f"  Entries: {len(entries)}")
+        print(f"  Total: {summary['total_tracked_minutes']}min")
+        print(f"  Work: {summary['work_minutes']}min, Personal: {summary['personal_minutes']}min")
+        print(f"  Projects: {len(summary['by_project'])}")
+    else:
+        print(f"  No screenshot data (completions only)")
+    print(f"  Git commits: {summary['git_commit_count']}")
+    print(f"  Agent sessions: {summary['agent_session_count']}")
+    print(f"  Calendar events: {summary['calendar_event_count']}")
+    print(f"  Emails sent: {summary['emails_sent_count']}")
+    print(f"  Google Docs edited: {summary['google_docs_edited_count']}")
+    print(f"  Completions: {completions_file}")
+
+    # Alert on collector errors
+    collector_errors = completions.get("_errors", [])
+    if collector_errors:
+        send_alert(
+            "critical",
+            f"Rollup collector errors ({date_str})",
+            "\n".join(collector_errors),
+        )
+
+    # Alert if no screenshot data for 3+ consecutive days
+    if not has_entries:
+        consecutive_empty = 1
+        check_date = datetime.strptime(date_str, "%Y-%m-%d")
+        for i in range(1, 5):  # check up to 4 days back
+            prev = (check_date - timedelta(days=i)).strftime("%Y-%m-%d")
+            prev_file = DAILY_DIR / f"{prev}.json"
+            if prev_file.exists():
+                try:
+                    with open(prev_file) as f:
+                        prev_data = json.load(f)
+                    if len(prev_data.get("entries", [])) > 0:
+                        break
+                except (json.JSONDecodeError, OSError):
+                    pass
+            consecutive_empty += 1
+
+        if consecutive_empty >= 3:
+            send_alert(
+                "critical",
+                f"No screenshot data for {consecutive_empty} consecutive days",
+                f"Last {consecutive_empty} days have no screenshot entries. "
+                "The day-tracker capture may be broken or the Mac has been off.",
+            )
 
     return True
 
@@ -235,8 +372,11 @@ def main():
         print(f"Invalid date format: {date_str} (expected YYYY-MM-DD)")
         sys.exit(1)
 
-    success = run_rollup(date_str)
-    sys.exit(0 if success else 1)
+    try:
+        run_rollup(date_str)
+    except Exception as e:
+        send_alert("critical", f"Rollup script crashed ({date_str})", str(e))
+        raise
 
 
 if __name__ == "__main__":

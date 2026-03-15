@@ -53,7 +53,7 @@ CATEGORIES = {
 DEFAULT_CONFIG = {
     "capture_interval_minutes": 2,
     "gemini_model": "gemini-2.5-flash-lite",  # Options: gemini-2.5-flash-lite, gemini-2.5-flash, gemini-3-flash-preview
-    "jpeg_quality": 70,
+    "jpeg_quality": 60,
     "thumbnail_size": [400, 225],  # 16:9 aspect
     "skip_similar_threshold": 0.02,  # Skip capture if <2% pixels changed (0 to disable)
     "categories": list(CATEGORIES.keys()),
@@ -72,7 +72,16 @@ DEFAULT_CONFIG = {
     "pause_until": None,
     "user_name": "",  # Your name — excluded from "people" extraction
     "blank_desktop_threshold": 0.05,  # Skip screen if <5% different from reference wallpaper (0 to disable)
-    "blank_desktop_crop_top": 50  # Pixels to crop from top before comparison (removes menu bar + notch)
+    "blank_desktop_crop_top": 50,  # Pixels to crop from top before comparison (removes menu bar + notch)
+    "skip_window_patterns": ["VLC", "TV"],  # Apps to skip capture for (entertainment, no Gemini call)
+    "app_rules": [  # Deterministic app-to-project/category rules (first match wins)
+        {"app": "WhatsApp", "category": "social", "is_work": False},
+        {"app": "Messages", "category": "social", "is_work": False},
+        {"app": "Telegram", "category": "social", "is_work": False},
+        {"app": "Signal", "category": "social", "is_work": False},
+        {"app": "Spotify", "category": "entertainment", "is_work": False},
+        {"app": "Obsidian", "project": "plans-and-reviews", "category": "writing"},
+    ]
 }
 
 
@@ -81,7 +90,7 @@ class CaptureConfig:
     """Runtime configuration for capture."""
     capture_interval_minutes: int = 2
     gemini_model: str = "gemini-2.5-flash-lite"
-    jpeg_quality: int = 50
+    jpeg_quality: int = 60
     thumbnail_size: tuple = (400, 225)
     skip_similar_threshold: float = 0.02  # Skip if <2% pixels changed (0 to disable)
     categories: list = field(default_factory=lambda: list(CATEGORIES.keys()))
@@ -92,6 +101,8 @@ class CaptureConfig:
     user_name: str = ""  # Your name — excluded from "people" extraction
     blank_desktop_threshold: float = 0.05  # Skip screen if <5% different from reference wallpaper
     blank_desktop_crop_top: int = 50  # Pixels to crop from top before comparison
+    skip_window_patterns: list = field(default_factory=lambda: DEFAULT_CONFIG["skip_window_patterns"].copy())
+    app_rules: list = field(default_factory=lambda: DEFAULT_CONFIG["app_rules"].copy())
 
 
 def ensure_directories():
@@ -133,7 +144,9 @@ def save_config(config: CaptureConfig):
         "pause_until": config.pause_until,
         "user_name": config.user_name,
         "blank_desktop_threshold": config.blank_desktop_threshold,
-        "blank_desktop_crop_top": config.blank_desktop_crop_top
+        "blank_desktop_crop_top": config.blank_desktop_crop_top,
+        "skip_window_patterns": config.skip_window_patterns,
+        "app_rules": config.app_rules
     }
 
     with open(CONFIG_FILE, "w") as f:
@@ -161,18 +174,26 @@ def save_projects(projects: dict):
 def load_known_projects() -> list:
     """Load projects from projects.yaml for AI context.
 
-    Returns a list of dicts with folder, name, and type.
+    Includes active projects, paused projects, and archived projects
+    that were archived less than 6 months ago.
     """
     if PROJECTS_YAML.exists():
         try:
             import yaml
+            from datetime import date, timedelta
             with open(PROJECTS_YAML) as f:
                 data = yaml.safe_load(f)
-            return [
-                {"folder": p["folder"], "name": p["name"], "type": p.get("type", "other")}
-                for p in data.get("projects", [])
-                if p.get("status") == "active"  # Only include active projects
-            ]
+            cutoff = date.today() - timedelta(days=182)
+            results = []
+            for p in data.get("projects", []):
+                status = p.get("status")
+                if status in ("active", "paused"):
+                    results.append({"folder": p["folder"], "name": p["name"], "type": p.get("type", "other")})
+                elif status == "archived":
+                    archived_date = p.get("archived_date")
+                    if archived_date and date.fromisoformat(str(archived_date)) >= cutoff:
+                        results.append({"folder": p["folder"], "name": p["name"], "type": p.get("type", "other")})
+            return results
         except Exception:
             pass
     return []

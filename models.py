@@ -68,6 +68,7 @@ class CaptureMetadata:
     excluded_blank_screens: List[str] = field(default_factory=list)  # Screens excluded (wallpaper only)
     active_sessions: Optional[List[dict]] = None  # Active agent sessions
     focus_history: Optional[List[dict]] = None  # Focus history summary [{app, title, pct}]
+    modified_files: Optional[List[str]] = None  # Files modified in the last few minutes
 
     def to_dict(self) -> dict:
         d = {
@@ -84,6 +85,8 @@ class CaptureMetadata:
             d["active_sessions"] = self.active_sessions
         if self.focus_history:
             d["focus_history"] = self.focus_history
+        if self.modified_files:
+            d["modified_files"] = self.modified_files
         return d
 
     @classmethod
@@ -98,7 +101,8 @@ class CaptureMetadata:
             manual_project=d.get("manual_project"),
             excluded_blank_screens=d.get("excluded_blank_screens", []),
             active_sessions=d.get("active_sessions"),
-            focus_history=d.get("focus_history")
+            focus_history=d.get("focus_history"),
+            modified_files=d.get("modified_files")
         )
 
     @property

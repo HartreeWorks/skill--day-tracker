@@ -24,6 +24,64 @@ from logging_config import log_capture_event, rotate_logs
 
 FOCUS_LOG_DIR = Path.home() / "Documents" / "day-tracker" / "data" / "focus-log"
 
+# Directories and patterns for modified file detection (mirrors active-directories CLI)
+MODIFIED_FILE_SCAN_DIRS = [
+    Path.home() / "Documents" / "www",
+    Path.home() / "Documents" / "Projects",
+    Path.home() / ".agents",
+]
+MODIFIED_FILE_EXTENSIONS = {
+    ".js", ".ts", ".tsx", ".jsx", ".md", ".json", ".yaml", ".yml",
+    ".py", ".rb", ".sh", ".css", ".html", ".vue", ".svelte",
+}
+MODIFIED_FILE_EXCLUDE_DIRS = {
+    "node_modules", ".next", ".next-build", "dist", "build", ".git",
+    ".venv", "__pycache__", ".contentlayer", ".convex", ".turbo", ".cache", ".vercel",
+}
+MODIFIED_FILE_EXCLUDE_NAMES = {
+    "package-lock.json", "yarn.lock", "tag-data.json", "platform-data.json",
+    "directory-tag-data.json", "search.json",
+}
+
+
+def get_recently_modified_files(minutes: int = 3, max_files: int = 20) -> List[str]:
+    """Find files modified in the last N minutes across project directories.
+
+    Returns paths relative to home directory, sorted most recent first.
+    """
+    import time
+
+    cutoff = time.time() - (minutes * 60)
+    results = []  # (mtime, relative_path)
+    home = Path.home()
+
+    for scan_dir in MODIFIED_FILE_SCAN_DIRS:
+        if not scan_dir.exists():
+            continue
+        for root, dirs, files in os.walk(scan_dir):
+            # Prune excluded directories in-place
+            dirs[:] = [d for d in dirs if d not in MODIFIED_FILE_EXCLUDE_DIRS]
+            for fname in files:
+                if fname in MODIFIED_FILE_EXCLUDE_NAMES:
+                    continue
+                fpath = Path(root) / fname
+                if fpath.suffix not in MODIFIED_FILE_EXTENSIONS:
+                    continue
+                try:
+                    mtime = fpath.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime >= cutoff:
+                    # Store path relative to home
+                    try:
+                        rel = str(fpath.relative_to(home))
+                    except ValueError:
+                        rel = str(fpath)
+                    results.append((mtime, rel))
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [path for _, path in results[:max_files]]
+
 
 def is_screen_locked() -> bool:
     """Check if the screen is locked."""
@@ -972,6 +1030,15 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
     except Exception as e:
         print(f"Focus history lookup failed: {e}")
 
+    # Get recently modified files
+    modified_files = None
+    try:
+        files = get_recently_modified_files(minutes=3)
+        if files:
+            modified_files = files
+    except Exception as e:
+        print(f"Modified files lookup failed: {e}")
+
     # Auto-detect project
     auto_project = match_project(active_window, visible_apps, config)
 
@@ -984,14 +1051,15 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         auto_project=auto_project,
         excluded_blank_screens=excluded_blank_screens,
         active_sessions=active_sessions,
-        focus_history=focus_history
+        focus_history=focus_history,
+        modified_files=modified_files
     )
 
     # Analyze with Gemini (unless skipped)
     if not skip_analysis:
         try:
             from analyze import analyze_capture
-            analysis = analyze_capture(capture_dir, screenshots, active_window, visible_apps, config, session_context=active_sessions, focus_history=focus_history)
+            analysis = analyze_capture(capture_dir, screenshots, active_window, visible_apps, config, session_context=active_sessions, focus_history=focus_history, modified_files=modified_files)
             metadata.analysis = analysis
 
             # Apply deterministic app rules (override AI inference)

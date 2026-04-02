@@ -60,7 +60,7 @@ def load_image_as_base64(image_path: Path) -> str:
     return f"data:{mime_type};base64,{data}"
 
 
-def build_prompt(active_window: Optional[ActiveWindow], visible_apps: List[str], categories: List[str], num_screens: int = 1, user_name: str = "", session_context: Optional[list] = None, focus_history: Optional[list] = None) -> str:
+def build_prompt(active_window: Optional[ActiveWindow], visible_apps: List[str], categories: List[str], num_screens: int = 1, user_name: str = "", session_context: Optional[list] = None, focus_history: Optional[list] = None, modified_files: Optional[list] = None) -> str:
     """Build the analysis prompt."""
     context_parts = []
 
@@ -118,6 +118,17 @@ FOCUS HISTORY (which windows had keyboard/mouse focus in the last 2 minutes):
 Weight your description toward the windows that had more focus time.
 """
 
+    # Build modified files section
+    modified_files_section = ""
+    if modified_files:
+        file_lines = [f"- {f}" for f in modified_files]
+        modified_files_section = f"""
+RECENTLY MODIFIED FILES (files changed on disk in the last 3 minutes):
+{chr(10).join(file_lines)}
+Use this to understand what the user is actively working on, even if not visible on screen.
+File paths are relative to the home directory. Use them for project attribution and activity description.
+"""
+
     # Multi-screen instruction
     screen_instruction = ""
     if num_screens > 1:
@@ -147,7 +158,7 @@ KNOWN PROJECTS (use folder name for inferred_project if you can match the visibl
 {screen_instruction}
 APPLICATION CONTEXT:
 {context}
-{session_section}{focus_section}{category_help}
+{session_section}{focus_section}{modified_files_section}{category_help}
 {projects_section}
 Provide a JSON response with these fields:
 
@@ -277,7 +288,8 @@ def analyze_capture(
     visible_apps: List[str],
     config: CaptureConfig,
     session_context: Optional[list] = None,
-    focus_history: Optional[list] = None
+    focus_history: Optional[list] = None,
+    modified_files: Optional[list] = None
 ) -> Optional[Analysis]:
     """
     Analyze screenshots using Gemini Flash.
@@ -300,7 +312,7 @@ def analyze_capture(
         return None
 
     # Build prompt (pass number of screens for multi-monitor awareness)
-    prompt = build_prompt(active_window, visible_apps, config.categories, num_screens=len(screenshots), user_name=config.user_name, session_context=session_context, focus_history=focus_history)
+    prompt = build_prompt(active_window, visible_apps, config.categories, num_screens=len(screenshots), user_name=config.user_name, session_context=session_context, focus_history=focus_history, modified_files=modified_files)
 
     # Load images
     images = []

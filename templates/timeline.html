@@ -1,0 +1,1397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DayLogger - {{ date_display }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #08090a;
+            --bg-gradient: linear-gradient(145deg, #08090a 0%, #0d1117 50%, #0a0c10 100%);
+            --surface: rgba(22, 27, 34, 0.8);
+            --surface-solid: #161b22;
+            --surface-hover: rgba(33, 41, 54, 0.9);
+            --surface-border: rgba(48, 54, 61, 0.6);
+            --text: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-tertiary: #6e7681;
+            --accent: #58a6ff;
+            --accent-glow: rgba(88, 166, 255, 0.15);
+            --accent-subtle: rgba(88, 166, 255, 0.08);
+            --green: #3fb950;
+            --green-subtle: rgba(63, 185, 80, 0.15);
+            --purple: #a371f7;
+            --purple-subtle: rgba(163, 113, 247, 0.15);
+            --orange: #d29922;
+            --orange-subtle: rgba(210, 153, 34, 0.15);
+            --red: #f85149;
+            --red-subtle: rgba(248, 81, 73, 0.12);
+            --radius: 12px;
+            --radius-sm: 8px;
+            --radius-xs: 6px;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+            --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
+            --shadow-lg: 0 8px 32px rgba(0,0,0,0.5);
+            --shadow-glow: 0 0 40px var(--accent-glow);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            background-image: var(--bg-gradient);
+            color: var(--text);
+            line-height: 1.5;
+            min-height: 100vh;
+            position: relative;
+        }
+
+        /* Subtle grid texture overlay */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(88, 166, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(88, 166, 255, 0.02) 1px, transparent 1px);
+            background-size: 64px 64px;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            max-width: 1440px;
+            margin: 0 auto;
+            padding: 32px 40px;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        .header-left {
+            display: flex;
+            align-items: baseline;
+            gap: 16px;
+        }
+
+        .logo {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            font-weight: 500;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+            padding: 6px 10px;
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            border-radius: var(--radius-xs);
+        }
+
+        h1 {
+            font-size: 1.75rem;
+            font-weight: 500;
+            letter-spacing: -0.02em;
+            color: var(--text);
+        }
+
+        .nav-dates {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .nav-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            border-radius: var(--radius-sm);
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            transition: all 0.2s ease;
+            font-size: 1rem;
+        }
+
+        .nav-btn:hover {
+            background: var(--surface-hover);
+            color: var(--text);
+            border-color: var(--accent);
+            box-shadow: var(--shadow-glow);
+        }
+
+        .date-select {
+            font-family: 'JetBrains Mono', monospace;
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--surface-border);
+            padding: 8px 14px;
+            border-radius: var(--radius-sm);
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .date-select:hover, .date-select:focus {
+            border-color: var(--accent);
+            outline: none;
+            box-shadow: var(--shadow-glow);
+        }
+
+        /* Stats Row */
+        .stats {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 32px;
+            flex-wrap: wrap;
+        }
+
+        .stat-card {
+            background: var(--surface);
+            backdrop-filter: blur(10px);
+            padding: 20px 24px;
+            border-radius: var(--radius);
+            border: 1px solid var(--surface-border);
+            min-width: 160px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--accent), transparent);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .stat-card:hover::before {
+            opacity: 1;
+        }
+
+        .stat-card.cost-card {
+            margin-left: auto;
+            background: linear-gradient(135deg, var(--surface) 0%, rgba(88, 166, 255, 0.05) 100%);
+        }
+
+        .stat-label {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-tertiary);
+            font-size: 0.7rem;
+            font-weight: 500;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 1.75rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            color: var(--text);
+        }
+
+        .stat-value.money {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--green);
+        }
+
+        .stat-sub {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            margin-top: 6px;
+        }
+
+        .stat-link {
+            font-size: 0.7rem;
+            color: var(--accent);
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            margin-top: 10px;
+            opacity: 0.8;
+            transition: opacity 0.2s ease;
+        }
+
+        .stat-link:hover {
+            opacity: 1;
+            text-decoration: underline;
+        }
+
+        /* Section Headers */
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            font-weight: 500;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+        }
+
+        .story-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 18px;
+            background: linear-gradient(135deg, var(--purple-subtle) 0%, var(--accent-subtle) 100%);
+            border: 1px solid var(--purple);
+            border-radius: var(--radius-sm);
+            color: var(--purple);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            font-weight: 500;
+            letter-spacing: 0.05em;
+            cursor: pointer;
+            transition: all 0.25s ease;
+        }
+
+        .story-btn:hover {
+            background: var(--purple);
+            color: var(--bg);
+            box-shadow: 0 0 24px var(--purple-subtle);
+            transform: translateY(-1px);
+        }
+
+        .story-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .story-btn .icon {
+            font-size: 1rem;
+        }
+
+        /* Recent Grid - 4 columns */
+        .recent-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 48px;
+        }
+
+        @media (max-width: 1200px) {
+            .recent-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 600px) {
+            .recent-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Timeline Grid */
+        .timeline {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .capture-card {
+            background: var(--surface);
+            border-radius: var(--radius);
+            overflow: hidden;
+            cursor: pointer;
+            border: 1px solid var(--surface-border);
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            animation: cardIn 0.4s ease backwards;
+        }
+
+        @keyframes cardIn {
+            from {
+                opacity: 0;
+                transform: translateY(16px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        {% for i in range(100) %}
+        .timeline .capture-card:nth-child({{ i + 1 }}) { animation-delay: {{ i * 0.03 }}s; }
+        {% endfor %}
+
+        .capture-card:hover {
+            transform: translateY(-4px);
+            border-color: var(--accent);
+            box-shadow: var(--shadow-lg), var(--shadow-glow);
+        }
+
+        .capture-card.sensitive {
+            border-color: var(--red);
+            box-shadow: 0 0 24px var(--red-subtle);
+        }
+
+        .capture-card.sensitive:hover {
+            border-color: var(--red);
+            box-shadow: var(--shadow-lg), 0 0 32px var(--red-subtle);
+        }
+
+        /* Blur sensitive thumbnails */
+        .capture-card.sensitive .capture-thumb {
+            filter: blur(20px);
+            transition: filter 0.3s ease;
+        }
+
+        .capture-card.sensitive .capture-thumb-wrapper::after {
+            content: 'Sensitive';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            font-weight: 500;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--red);
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px 16px;
+            border-radius: var(--radius-xs);
+            border: 1px solid var(--red);
+            pointer-events: none;
+            opacity: 1;
+            transition: opacity 0.3s ease;
+        }
+
+        .capture-card.sensitive.revealed .capture-thumb {
+            filter: blur(0);
+        }
+
+        .capture-card.sensitive.revealed .capture-thumb-wrapper::after {
+            opacity: 0;
+        }
+
+        /* Recent cards - larger thumbnails */
+        .recent-grid .capture-card {
+            animation: none;
+        }
+
+        .recent-grid .capture-card:nth-child(1) { animation: cardIn 0.4s ease 0.05s backwards; }
+        .recent-grid .capture-card:nth-child(2) { animation: cardIn 0.4s ease 0.1s backwards; }
+        .recent-grid .capture-card:nth-child(3) { animation: cardIn 0.4s ease 0.15s backwards; }
+        .recent-grid .capture-card:nth-child(4) { animation: cardIn 0.4s ease 0.2s backwards; }
+
+        .capture-thumb-wrapper {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .capture-thumb {
+            width: 100%;
+            aspect-ratio: 16/9;
+            object-fit: cover;
+            background: var(--surface-solid);
+            display: block;
+            transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .capture-card:hover .capture-thumb {
+            transform: scale(1.03);
+        }
+
+        .capture-time-badge {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            font-weight: 500;
+            padding: 5px 10px;
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(8px);
+            border-radius: var(--radius-xs);
+            color: var(--text);
+            letter-spacing: 0.05em;
+        }
+
+        .capture-info {
+            padding: 16px;
+        }
+
+        .capture-oneline {
+            font-size: 0.95rem;
+            font-weight: 400;
+            line-height: 1.5;
+            margin-bottom: 12px;
+            color: var(--text);
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .capture-meta {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .tag {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.65rem;
+            font-weight: 500;
+            padding: 4px 10px;
+            border-radius: 20px;
+            letter-spacing: 0.03em;
+            text-transform: lowercase;
+        }
+
+        .tag.category {
+            background: var(--green-subtle);
+            color: var(--green);
+            border: 1px solid rgba(63, 185, 80, 0.25);
+        }
+
+        .tag.project {
+            background: var(--purple-subtle);
+            color: var(--purple);
+            border: 1px solid rgba(163, 113, 247, 0.25);
+        }
+
+        .tag.sensitive {
+            background: var(--red-subtle);
+            color: var(--red);
+            border: 1px solid rgba(248, 81, 73, 0.25);
+        }
+
+        /* Divider */
+        .section-divider {
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--surface-border), transparent);
+            margin: 40px 0;
+        }
+
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.92);
+            backdrop-filter: blur(12px);
+            z-index: 1000;
+            padding: 40px;
+            overflow: auto;
+        }
+
+        .modal.active {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            animation: modalIn 0.25s ease;
+        }
+
+        @keyframes modalIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .modal-close {
+            position: fixed;
+            top: 24px;
+            right: 28px;
+            font-size: 1.5rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            z-index: 1001;
+            width: 44px;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            border-radius: var(--radius-sm);
+            transition: all 0.2s ease;
+        }
+
+        .modal-close:hover {
+            color: var(--text);
+            background: var(--surface-hover);
+            border-color: var(--accent);
+        }
+
+        .modal-content {
+            max-width: 1200px;
+            width: 100%;
+            animation: modalContentIn 0.35s cubic-bezier(0.4, 0, 0.2, 1) 0.1s backwards;
+        }
+
+        @keyframes modalContentIn {
+            from {
+                opacity: 0;
+                transform: translateY(24px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .modal-images {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .modal-image {
+            flex: 1;
+            min-width: 300px;
+            border-radius: var(--radius);
+            cursor: zoom-in;
+            transition: transform 0.2s ease;
+            border: 1px solid var(--surface-border);
+        }
+
+        .modal-image:hover {
+            transform: scale(1.01);
+        }
+
+        .modal-image.solo {
+            min-width: 100%;
+        }
+
+        .modal-details {
+            background: var(--surface);
+            backdrop-filter: blur(10px);
+            padding: 24px;
+            border-radius: var(--radius);
+            border: 1px solid var(--surface-border);
+        }
+
+        .modal-description {
+            font-size: 1.05rem;
+            line-height: 1.7;
+            margin-bottom: 20px;
+            color: var(--text);
+        }
+
+        .modal-active-window {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--text-tertiary);
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--surface-border);
+        }
+
+        /* Story Modal */
+        .story-modal {
+            max-width: 800px;
+        }
+
+        .story-modal .modal-content {
+            max-width: 800px;
+        }
+
+        .story-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 24px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        .story-header .icon {
+            font-size: 1.5rem;
+        }
+
+        .story-header h2 {
+            font-size: 1.25rem;
+            font-weight: 500;
+        }
+
+        .story-content {
+            font-size: 0.95rem;
+            line-height: 1.7;
+            color: var(--text);
+        }
+
+        .story-content h2 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text);
+            margin: 0 0 16px 0;
+        }
+
+        .story-content h3 {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--accent);
+            margin: 28px 0 14px 0;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        .story-content h2:first-child,
+        .story-content h3:first-child {
+            margin-top: 0;
+        }
+
+        .story-content p {
+            margin-bottom: 12px;
+            color: var(--text);
+        }
+
+        .story-content ul {
+            list-style: none;
+            padding: 0;
+            margin: 0 0 16px 0;
+        }
+
+        .story-content li {
+            position: relative;
+            padding-left: 20px;
+            margin-bottom: 10px;
+            color: var(--text);
+            line-height: 1.6;
+        }
+
+        .story-content li::before {
+            content: '•';
+            position: absolute;
+            left: 4px;
+            color: var(--text-tertiary);
+        }
+
+        .story-content strong {
+            color: var(--text);
+            font-weight: 500;
+        }
+
+        .story-content .cached-note {
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid var(--surface-border);
+            font-size: 0.8rem;
+            color: var(--text-tertiary);
+        }
+
+        .story-content .cached-note a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        .story-content .cached-note a:hover {
+            text-decoration: underline;
+        }
+
+        .story-loading {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-tertiary);
+        }
+
+        .story-loading .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--surface-border);
+            border-top-color: var(--purple);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Logs Button */
+        .logs-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 18px;
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            font-weight: 500;
+            letter-spacing: 0.05em;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            margin-right: 12px;
+        }
+
+        .logs-btn:hover {
+            background: var(--surface-hover);
+            color: var(--text);
+            border-color: var(--accent);
+        }
+
+        /* Logs Modal */
+        .logs-list {
+            max-height: 500px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+
+        .log-entry {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--surface-border);
+            display: grid;
+            grid-template-columns: 90px 120px 1fr;
+            gap: 16px;
+            align-items: start;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-time {
+            color: var(--text-tertiary);
+            font-size: 0.7rem;
+        }
+
+        .log-action {
+            font-size: 0.7rem;
+            padding: 3px 8px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 500;
+        }
+
+        .log-action.completed { background: var(--green-subtle); color: var(--green); }
+        .log-action.captured { background: var(--accent-subtle); color: var(--accent); }
+        .log-action.analyzed { background: var(--purple-subtle); color: var(--purple); }
+        .log-action.started { background: var(--surface-hover); color: var(--text-tertiary); }
+        .log-action.skipped_similar { background: var(--orange-subtle); color: var(--orange); }
+        .log-action.skipped_paused { background: var(--orange-subtle); color: var(--orange); }
+        .log-action.skipped_sensitive { background: var(--red-subtle); color: var(--red); }
+        .log-action.error { background: var(--red-subtle); color: var(--red); }
+
+        .log-message {
+            color: var(--text);
+            word-break: break-word;
+        }
+
+        .log-details {
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            margin-top: 4px;
+        }
+
+        .logs-summary {
+            display: flex;
+            gap: 12px;
+            padding: 16px;
+            background: var(--surface-hover);
+            border-radius: var(--radius-sm);
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+
+        .logs-summary-item {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .logs-summary-item strong {
+            color: var(--text);
+        }
+
+        .logs-empty {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-tertiary);
+        }
+
+        /* Fullscreen Overlay */
+        .fullscreen-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.97);
+            z-index: 2000;
+            cursor: zoom-out;
+            padding: 32px;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .fullscreen-overlay.active {
+            display: flex;
+            animation: fadeIn 0.2s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        #fullscreen-image {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: var(--radius-sm);
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 100px 20px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 4rem;
+            margin-bottom: 24px;
+            opacity: 0.3;
+        }
+
+        .empty-state h2 {
+            font-size: 1.5rem;
+            font-weight: 500;
+            margin-bottom: 12px;
+            color: var(--text);
+        }
+
+        .empty-state p {
+            color: var(--text-tertiary);
+            max-width: 400px;
+            margin: 0 auto;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+            }
+
+            header {
+                flex-direction: column;
+                gap: 16px;
+                align-items: flex-start;
+            }
+
+            .section-header {
+                flex-direction: column;
+                gap: 12px;
+                align-items: flex-start;
+            }
+
+            .stats {
+                gap: 12px;
+            }
+
+            .stat-card {
+                min-width: 140px;
+                padding: 16px;
+            }
+
+            .stat-card.cost-card {
+                margin-left: 0;
+                width: 100%;
+            }
+
+            .timeline {
+                grid-template-columns: 1fr;
+            }
+
+            .modal {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <span class="logo">DayLogger</span>
+                <h1>{{ date_display }}</h1>
+            </div>
+            <div class="nav-dates">
+                {% if prev_date %}
+                <a href="/day/{{ prev_date }}" class="nav-btn" title="Previous day">&larr;</a>
+                {% endif %}
+
+                <select class="date-select" onchange="window.location.href='/day/' + this.value">
+                    {% for d in available_dates %}
+                    <option value="{{ d }}" {% if d == date %}selected{% endif %}>{{ d }}</option>
+                    {% endfor %}
+                </select>
+
+                {% if next_date %}
+                <a href="/day/{{ next_date }}" class="nav-btn" title="Next day">&rarr;</a>
+                {% endif %}
+            </div>
+        </header>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-label">Captures</div>
+                <div class="stat-value">{{ stats.total_captures }}</div>
+            </div>
+
+            {% if stats.by_category %}
+            <div class="stat-card">
+                <div class="stat-label">Top Category</div>
+                <div class="stat-value">
+                    {% set top_cat = stats.by_category | dictsort(by='value', reverse=true) | first %}
+                    {{ top_cat[0] }}
+                </div>
+                <div class="stat-sub">{{ top_cat[1] }} captures</div>
+            </div>
+            {% endif %}
+
+            {% if stats.by_project %}
+            <div class="stat-card">
+                <div class="stat-label">Projects</div>
+                <div class="stat-value">{{ stats.by_project | length }}</div>
+            </div>
+            {% endif %}
+
+            {% if stats.sensitive_count > 0 %}
+            <div class="stat-card">
+                <div class="stat-label">Sensitive</div>
+                <div class="stat-value">{{ stats.sensitive_count }}</div>
+            </div>
+            {% endif %}
+
+            <div class="stat-card cost-card">
+                <div class="stat-label">7-Day API Cost</div>
+                <div class="stat-value money">${{ "%.4f"|format(costs.total_cost_usd) }}</div>
+                <div class="stat-sub">{{ "{:,}".format(costs.total_input_tokens) }} tokens</div>
+                <a href="https://aistudio.google.com/app/usage?timeRange=last-28-days&tab=billing" target="_blank" class="stat-link">
+                    Verify in AI Studio <span>&nearr;</span>
+                </a>
+            </div>
+        </div>
+
+        {% if captures %}
+        <!-- Recent Section -->
+        <div class="section-header">
+            <span class="section-title">Recent Activity</span>
+            <div>
+                <button class="logs-btn" onclick="openLogs()">
+                    <span class="icon">&#9776;</span>
+                    Logs
+                </button>
+                <button class="story-btn" onclick="getDayDigest()" id="story-btn">
+                    <span class="icon">&#9783;</span>
+                    Get Day Digest
+                </button>
+            </div>
+        </div>
+
+        <div class="recent-grid">
+            {% for capture in captures[-4:]|reverse %}
+            <div class="capture-card {% if capture.analysis and capture.analysis.sensitive %}sensitive{% endif %}"
+                 onclick="handleCardClick(event, '{{ capture.path }}', '{{ capture.thumbnail | default('') }}')">
+
+                <div class="capture-thumb-wrapper">
+                    {% if capture.thumbnail %}
+                    <img src="{{ capture.thumbnail }}" alt="Screenshot" class="capture-thumb" loading="lazy">
+                    {% else %}
+                    <div class="capture-thumb"></div>
+                    {% endif %}
+                    <div class="capture-time-badge">{{ capture.time }}</div>
+                </div>
+
+                <div class="capture-info">
+                    {% if capture.analysis %}
+                    <div class="capture-oneline">{{ capture.analysis.oneline }}</div>
+                    <div class="capture-meta">
+                        <span class="tag category">{{ capture.analysis.category }}</span>
+                        {% if capture.manual_project or capture.auto_project %}
+                        <span class="tag project">{{ capture.manual_project or capture.auto_project }}</span>
+                        {% endif %}
+                        {% if capture.analysis.sensitive %}
+                        <span class="tag sensitive">sensitive</span>
+                        {% endif %}
+                    </div>
+                    {% else %}
+                    <div class="capture-oneline">
+                        {% if capture.active_window %}
+                        {{ capture.active_window.app }}
+                        {% else %}
+                        Awaiting analysis...
+                        {% endif %}
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="section-divider"></div>
+
+        <!-- Full Timeline Section -->
+        <div class="section-header">
+            <span class="section-title">Full Timeline</span>
+        </div>
+
+        <div class="timeline">
+            {% for capture in captures %}
+            <div class="capture-card {% if capture.analysis and capture.analysis.sensitive %}sensitive{% endif %}"
+                 onclick="handleCardClick(event, '{{ capture.path }}', '{{ capture.thumbnail | default('') }}')">
+
+                <div class="capture-thumb-wrapper">
+                    {% if capture.thumbnail %}
+                    <img src="{{ capture.thumbnail }}" alt="Screenshot" class="capture-thumb" loading="lazy">
+                    {% else %}
+                    <div class="capture-thumb"></div>
+                    {% endif %}
+                    <div class="capture-time-badge">{{ capture.time }}</div>
+                </div>
+
+                <div class="capture-info">
+                    {% if capture.analysis %}
+                    <div class="capture-oneline">{{ capture.analysis.oneline }}</div>
+                    <div class="capture-meta">
+                        <span class="tag category">{{ capture.analysis.category }}</span>
+                        {% if capture.manual_project or capture.auto_project %}
+                        <span class="tag project">{{ capture.manual_project or capture.auto_project }}</span>
+                        {% endif %}
+                        {% if capture.analysis.sensitive %}
+                        <span class="tag sensitive">sensitive</span>
+                        {% endif %}
+                    </div>
+                    {% else %}
+                    <div class="capture-oneline">
+                        {% if capture.active_window %}
+                        {{ capture.active_window.app }}
+                        {% else %}
+                        Awaiting analysis...
+                        {% endif %}
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <div class="empty-state-icon">&#9711;</div>
+            <h2>No captures for this day</h2>
+            <p>Screenshots will appear here once DayLogger starts capturing your screen activity.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Modal for full-size view -->
+    <div class="modal" id="modal">
+        <span class="modal-close" onclick="closeModal()">&times;</span>
+        <div class="modal-content">
+            <div class="modal-images" id="modal-images">
+                <!-- Images inserted by JS -->
+            </div>
+            <div class="modal-details" id="modal-details">
+                Loading...
+            </div>
+        </div>
+    </div>
+
+    <!-- Digest Modal -->
+    <div class="modal story-modal" id="story-modal">
+        <span class="modal-close" onclick="closeStoryModal()">&times;</span>
+        <div class="modal-content">
+            <div class="modal-details">
+                <div class="story-header">
+                    <span class="icon">&#9783;</span>
+                    <h2>Day Digest</h2>
+                </div>
+                <div id="story-content" class="story-content">
+                    <div class="story-loading">
+                        <div class="spinner"></div>
+                        <p>Analyzing your day...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logs Modal -->
+    <div class="modal story-modal" id="logs-modal">
+        <span class="modal-close" onclick="closeLogsModal()">&times;</span>
+        <div class="modal-content">
+            <div class="modal-details">
+                <div class="story-header">
+                    <span class="icon">&#9776;</span>
+                    <h2>Capture Logs</h2>
+                </div>
+                <div id="logs-content">
+                    <div class="story-loading">
+                        <div class="spinner"></div>
+                        <p>Loading logs...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Fullscreen image overlay -->
+    <div class="fullscreen-overlay" id="fullscreen" onclick="closeFullscreen()">
+        <img src="" alt="Fullscreen" id="fullscreen-image">
+    </div>
+
+    <script>
+        function handleCardClick(event, path, thumbnailUrl) {
+            const card = event.currentTarget;
+            // If sensitive and not yet revealed, just reveal it
+            if (card.classList.contains('sensitive') && !card.classList.contains('revealed')) {
+                event.stopPropagation();
+                card.classList.add('revealed');
+                return;
+            }
+            // Otherwise open the modal
+            openModal(path, thumbnailUrl);
+        }
+
+        function openModal(path, thumbnailUrl) {
+            const modal = document.getElementById('modal');
+            const modalImages = document.getElementById('modal-images');
+            const modalDetails = document.getElementById('modal-details');
+
+            modal.classList.add('active');
+            modalImages.innerHTML = '<p style="color: var(--text-tertiary)">Loading...</p>';
+
+            // Fetch full capture details
+            fetch('/api/captures?date={{ date }}')
+                .then(r => r.json())
+                .then(data => {
+                    const capture = data.captures.find(c => c.path === path);
+                    if (capture) {
+                        // Show all screens
+                        const screens = capture.screens || [];
+                        const isSolo = screens.length === 1;
+                        modalImages.innerHTML = screens.map((screen, i) =>
+                            `<img src="/screenshot/${path}/${screen}"
+                                  alt="Screen ${i + 1}"
+                                  class="modal-image ${isSolo ? 'solo' : ''}"
+                                  onclick="openFullscreen(this.src)"
+                                  title="Click to enlarge">`
+                        ).join('');
+
+                        if (capture.analysis) {
+                            modalDetails.innerHTML = `
+                                <div class="modal-description">${capture.analysis.description}</div>
+                                <div class="capture-meta">
+                                    <span class="tag category">${capture.analysis.category}</span>
+                                    ${capture.manual_project || capture.auto_project ?
+                                        `<span class="tag project">${capture.manual_project || capture.auto_project}</span>` : ''}
+                                    ${capture.analysis.sensitive ?
+                                        `<span class="tag sensitive">Sensitive: ${capture.analysis.sensitive_reason || 'flagged'}</span>` : ''}
+                                </div>
+                                <p class="modal-active-window">
+                                    Active: ${capture.active_window ? capture.active_window.app + ' — ' + capture.active_window.title : 'Unknown'}
+                                </p>
+                            `;
+                        }
+                    }
+                });
+        }
+
+        function getDayDigest() {
+            const btn = document.getElementById('story-btn');
+            const modal = document.getElementById('story-modal');
+            const content = document.getElementById('story-content');
+
+            btn.disabled = true;
+            modal.classList.add('active');
+            content.innerHTML = `
+                <div class="story-loading">
+                    <div class="spinner"></div>
+                    <p>Analyzing your day...</p>
+                </div>
+            `;
+
+            fetch('/api/story?date={{ date }}')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.html) {
+                        content.innerHTML = data.html;
+                        if (data.cached) {
+                            // Add a subtle indicator that this is cached
+                            content.insertAdjacentHTML('beforeend',
+                                '<p class="cached-note">Cached digest. <a href="#" onclick="regenerateDigest(); return false;">Regenerate</a></p>');
+                        }
+                    } else if (data.error) {
+                        content.innerHTML = `<p style="color: var(--red);">Error: ${data.error}</p>`;
+                    }
+                })
+                .catch(err => {
+                    content.innerHTML = `<p style="color: var(--red);">Failed to generate digest: ${err.message}</p>`;
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                });
+        }
+
+        function closeStoryModal() {
+            document.getElementById('story-modal').classList.remove('active');
+        }
+
+        function regenerateDigest() {
+            const content = document.getElementById('story-content');
+            content.innerHTML = `
+                <div class="story-loading">
+                    <div class="spinner"></div>
+                    <p>Regenerating digest...</p>
+                </div>
+            `;
+
+            fetch('/api/story?date={{ date }}&force=true')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.html) {
+                        content.innerHTML = data.html;
+                    } else if (data.error) {
+                        content.innerHTML = `<p style="color: var(--red);">Error: ${data.error}</p>`;
+                    }
+                })
+                .catch(err => {
+                    content.innerHTML = `<p style="color: var(--red);">Failed to regenerate: ${err.message}</p>`;
+                });
+        }
+
+        function openLogs() {
+            const modal = document.getElementById('logs-modal');
+            const content = document.getElementById('logs-content');
+
+            modal.classList.add('active');
+            content.innerHTML = `
+                <div class="story-loading">
+                    <div class="spinner"></div>
+                    <p>Loading logs...</p>
+                </div>
+            `;
+
+            fetch('/api/logs?limit=50')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.logs && data.logs.length > 0) {
+                        // Build summary
+                        let summaryHtml = '<div class="logs-summary">';
+                        for (const [action, count] of Object.entries(data.summary || {})) {
+                            summaryHtml += `<span class="logs-summary-item"><strong>${count}</strong> ${action.replace('_', ' ')}</span>`;
+                        }
+                        summaryHtml += '</div>';
+
+                        // Build logs list
+                        let logsHtml = '<div class="logs-list">';
+                        for (const log of data.logs) {
+                            const time = log.timestamp ? new Date(log.timestamp).toLocaleTimeString('en-US', {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                hour12: false
+                            }) : '';
+                            const action = log.action || 'info';
+                            const details = log.details ? JSON.stringify(log.details) : '';
+
+                            logsHtml += `
+                                <div class="log-entry">
+                                    <span class="log-time">${time}</span>
+                                    <span class="log-action ${action}">${action.replace('_', ' ')}</span>
+                                    <div>
+                                        <div class="log-message">${log.message || ''}</div>
+                                        ${log.reason ? `<div class="log-details">Reason: ${log.reason}</div>` : ''}
+                                    </div>
+                                </div>
+                            `;
+                        }
+                        logsHtml += '</div>';
+
+                        content.innerHTML = summaryHtml + logsHtml;
+                    } else {
+                        content.innerHTML = '<div class="logs-empty">No logs yet. Logs will appear after the next capture cycle.</div>';
+                    }
+                })
+                .catch(err => {
+                    content.innerHTML = `<p style="color: var(--red);">Failed to load logs: ${err.message}</p>`;
+                });
+        }
+
+        function closeLogsModal() {
+            document.getElementById('logs-modal').classList.remove('active');
+        }
+
+        function openFullscreen(src) {
+            const overlay = document.getElementById('fullscreen');
+            const img = document.getElementById('fullscreen-image');
+            img.src = src;
+            overlay.classList.add('active');
+        }
+
+        function closeFullscreen() {
+            document.getElementById('fullscreen').classList.remove('active');
+        }
+
+        function closeModal() {
+            document.getElementById('modal').classList.remove('active');
+        }
+
+        // Close on escape key
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') {
+                closeFullscreen();
+                closeModal();
+                closeStoryModal();
+                closeLogsModal();
+            }
+        });
+
+        // Close on click outside
+        document.getElementById('modal').addEventListener('click', e => {
+            if (e.target.id === 'modal') closeModal();
+        });
+
+        document.getElementById('story-modal').addEventListener('click', e => {
+            if (e.target.id === 'story-modal') closeStoryModal();
+        });
+
+        document.getElementById('logs-modal').addEventListener('click', e => {
+            if (e.target.id === 'logs-modal') closeLogsModal();
+        });
+    </script>
+</body>
+</html>

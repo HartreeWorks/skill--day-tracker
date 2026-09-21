@@ -1,0 +1,133 @@
+#!/bin/bash
+# Returns active window info and visible apps as JSON.
+# Requires Accessibility permission for this app only.
+#
+# With --incognito-only: instead returns the bounds of any incognito/private
+# browser windows as JSON. Requires Automation permission to control the
+# supported Chromium browsers (granted once, attributed to this .app bundle).
+#
+# Routing the browser query through this .app bundle keeps the Automation grant
+# stable under launchd, where a raw osascript from the launchd python process
+# could not be granted interactively. This mirrors how the System Events
+# (Accessibility) query below is already attributed to this bundle.
+
+# Supported browser(s) for incognito detection. Only queried if installed, so a
+# `tell` block is never compiled against a missing app (which would hang on a
+# "where is?" dialog). Chrome only by request; other Chromium browsers share the
+# same `mode`/`bounds` dictionary and could be re-added here if ever needed.
+SUPPORTED_BROWSERS=("Google Chrome")
+
+app_installed() {
+    local app="$1"
+    [ -d "/Applications/$app.app" ] || [ -d "$HOME/Applications/$app.app" ]
+}
+
+# Query one browser for incognito window bounds. The app name is interpolated by
+# bash into the osascript source, so osascript compiles `mode`/`bounds` against
+# the real (installed) app's dictionary at runtime.
+query_browser_incognito() {
+    local app="$1"
+    osascript <<OSA
+try
+    if application "$app" is running then
+        tell application "$app"
+            set out to ""
+            repeat with w in windows
+                try
+                    if (mode of w) is "incognito" then
+                        set b to bounds of w
+                        set out to out & "$app" & "::" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b) & "|||"
+                    end if
+                end try
+            end repeat
+            return out
+        end tell
+    else
+        return ""
+    end if
+on error errMsg
+    return "<<<ERR>>>$app: " & errMsg & "|||"
+end try
+OSA
+}
+
+if [ "$1" = "--incognito-only" ]; then
+    RAW=""
+    for app in "${SUPPORTED_BROWSERS[@]}"; do
+        if app_installed "$app"; then
+            RAW="$RAW$(query_browser_incognito "$app")"
+        fi
+    done
+
+    echo "$RAW" | /usr/bin/python3 -c "
+import json, sys
+raw = sys.stdin.read().strip()
+windows = []
+error = None
+for token in raw.split('|||'):
+    token = token.strip()
+    if not token:
+        continue
+    if token.startswith('<<<ERR>>>'):
+        msg = token[9:]
+        error = (error + '; ' + msg) if error else msg
+        continue
+    try:
+        app, coords = token.split('::', 1)
+        nums = [float(x) for x in coords.split(',')]
+        if len(nums) == 4:
+            windows.append({'app': app, 'bounds': nums})
+    except Exception:
+        continue
+print(json.dumps({'incognito_windows': windows, 'error': error}, ensure_ascii=False))
+"
+    exit 0
+fi
+
+# Default: active window info and visible apps (unchanged contract).
+RAW=$(osascript <<'APPLESCRIPT'
+try
+    tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        set appName to name of frontApp
+        try
+            set windowTitle to name of front window of frontApp
+        on error
+            set windowTitle to ""
+        end try
+
+        set visibleApps to name of every application process whose visible is true
+        set appList to ""
+        repeat with a in visibleApps
+            set appList to appList & a & "|||"
+        end repeat
+    end tell
+
+    return appName & "<<<SEP>>>" & windowTitle & "<<<SEP>>>" & appList
+on error errMsg
+    return "<<<ERROR>>>" & errMsg
+end try
+APPLESCRIPT
+)
+
+# Pipe raw data to Python via stdin to avoid shell interpolation issues
+echo "$RAW" | /usr/bin/python3 -c "
+import json
+import sys
+
+raw = sys.stdin.read().strip()
+
+if raw.startswith('<<<ERROR>>>'):
+    print(json.dumps({'error': raw[11:]}))
+else:
+    parts = raw.split('<<<SEP>>>')
+    if len(parts) >= 3:
+        title = parts[1] if parts[1] != 'missing value' else ''
+        print(json.dumps({
+            'app': parts[0],
+            'title': title,
+            'visible_apps': parts[2]
+        }, ensure_ascii=False))
+    else:
+        print(json.dumps({'error': 'Parse failed'}))
+"

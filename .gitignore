@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Virtual environment
+.venv/
+
+# Temp files
+tmp/
+
+# Logs
+*.log
+*.err
+
+# Private runtime data and credentials
+data/
+config.json
+.env
+.env.*
+*.env
+*.key
+*.pem
+*secret*
+*credential*
+*token*
+node_modules/
+.idea/
+.vscode/
+
+# Internal plans and machine-specific capture wrapper (kept locally)
+docs/
+DayTrackerCapture.app/
+
+# Local publication manifest
+.publish-state.json

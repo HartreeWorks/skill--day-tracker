@@ -1,5 +1,5 @@
 #!/bin/bash
-# Returns active window info and visible apps as JSON.
+# Returns active window info as JSON. Python obtains visible apps via Quartz.
 # Requires Accessibility permission for this app only.
 #
 # With --incognito-only: instead returns the bounds of any incognito/private
@@ -84,7 +84,7 @@ print(json.dumps({'incognito_windows': windows, 'error': error}, ensure_ascii=Fa
     exit 0
 fi
 
-# Default: active window info and visible apps (unchanged contract).
+# Default: active window info.
 RAW=$(osascript <<'APPLESCRIPT'
 try
     tell application "System Events"
@@ -96,14 +96,9 @@ try
             set windowTitle to ""
         end try
 
-        set visibleApps to name of every application process whose visible is true
-        set appList to ""
-        repeat with a in visibleApps
-            set appList to appList & a & "|||"
-        end repeat
     end tell
 
-    return appName & "<<<SEP>>>" & windowTitle & "<<<SEP>>>" & appList
+    return appName & "<<<SEP>>>" & windowTitle
 on error errMsg
     return "<<<ERROR>>>" & errMsg
 end try
@@ -121,12 +116,11 @@ if raw.startswith('<<<ERROR>>>'):
     print(json.dumps({'error': raw[11:]}))
 else:
     parts = raw.split('<<<SEP>>>')
-    if len(parts) >= 3:
+    if len(parts) >= 2:
         title = parts[1] if parts[1] != 'missing value' else ''
         print(json.dumps({
             'app': parts[0],
-            'title': title,
-            'visible_apps': parts[2]
+            'title': title
         }, ensure_ascii=False))
     else:
         print(json.dumps({'error': 'Parse failed'}))

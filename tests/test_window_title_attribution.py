@@ -74,7 +74,8 @@ class GetWindowInfoTests(unittest.TestCase):
         payload = {"app": "Google Chrome", "title": "StatusIndicator",
                    "visible_apps": "Google Chrome|||Finder|||"}
         with patch("capture.subprocess.run", return_value=helper_result(payload)), \
-             patch("capture.get_frontmost_window_title", return_value="Inbox — Gmail"):
+             patch("capture.get_frontmost_window_title", return_value="Inbox — Gmail"), \
+             patch("capture.get_visible_apps", return_value=["Google Chrome", "Finder"]):
             active, visible = capture.get_window_info()
         self.assertEqual(active.app, "Google Chrome")
         self.assertEqual(active.title, "Inbox — Gmail")
@@ -84,7 +85,8 @@ class GetWindowInfoTests(unittest.TestCase):
         """If Quartz also only sees the overlay, an empty title beats a wrong one."""
         payload = {"app": "Slack", "title": "StatusIndicator", "visible_apps": "Slack|||"}
         with patch("capture.subprocess.run", return_value=helper_result(payload)), \
-             patch("capture.get_frontmost_window_title", return_value="StatusIndicator"):
+             patch("capture.get_frontmost_window_title", return_value="StatusIndicator"), \
+             patch("capture.get_visible_apps", return_value=["Slack"]):
             active, _ = capture.get_window_info()
         self.assertEqual(active.app, "Slack")
         self.assertEqual(active.title, "")
@@ -92,9 +94,40 @@ class GetWindowInfoTests(unittest.TestCase):
     def test_good_helper_title_is_preserved(self):
         payload = {"app": "stable", "title": "aisa re-skin", "visible_apps": "stable|||"}
         with patch("capture.subprocess.run", return_value=helper_result(payload)), \
-             patch("capture.get_frontmost_window_title", return_value="SHOULD NOT BE USED"):
+             patch("capture.get_frontmost_window_title", return_value="SHOULD NOT BE USED"), \
+             patch("capture.get_visible_apps", return_value=["stable"]):
             active, _ = capture.get_window_info()
         self.assertEqual(active.title, "aisa re-skin")
+
+    def test_helper_visible_apps_are_ignored_in_favour_of_quartz_reader(self):
+        payload = {
+            "app": "stable",
+            "title": "aisa re-skin",
+            "visible_apps": "Stale Helper App|||",
+        }
+        with patch("capture.subprocess.run", return_value=helper_result(payload)), \
+             patch("capture.get_visible_apps", return_value=["Fresh Quartz App"]):
+            active, visible = capture.get_window_info()
+
+        self.assertEqual(active.app, "stable")
+        self.assertEqual(visible, ["Fresh Quartz App"])
+
+    def test_visible_apps_are_returned_when_helper_fails(self):
+        with patch("capture.subprocess.run", side_effect=RuntimeError("helper unavailable")), \
+             patch("capture.get_visible_apps", return_value=["Fresh Quartz App"]):
+            active, visible = capture.get_window_info()
+
+        self.assertIsNone(active)
+        self.assertEqual(visible, ["Fresh Quartz App"])
+
+    def test_visible_apps_are_returned_when_helper_reports_an_error(self):
+        payload = {"error": "Accessibility permission missing", "visible_apps": "Stale|||"}
+        with patch("capture.subprocess.run", return_value=helper_result(payload)), \
+             patch("capture.get_visible_apps", return_value=["Fresh Quartz App"]):
+            active, visible = capture.get_window_info()
+
+        self.assertIsNone(active)
+        self.assertEqual(visible, ["Fresh Quartz App"])
 
 
 class SensitivePreFilterTests(unittest.TestCase):

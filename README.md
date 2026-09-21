@@ -24,6 +24,8 @@ An illustrative caption record, using fictional data:
 
 Time totals are estimates from two-minute samples. Completion records remain separate: an agent running in the background does not count as human working time.
 
+`visible_apps` lists each app once when a window has exposed area on an active display. Minimised windows, other desktops, fully covered windows and menu-bar icons do not count. Wispr Flow is always ignored, including when checking whether other windows are covered. Visibility uses window bounds and opacity, so rounded corners and per-pixel transparency are approximate. If the window query fails, the list is empty.
+
 ## Requirements and scope
 
 - macOS, Python and a Gemini API key. The Python code uses Pillow, PyYAML, google-genai, FastAPI, Uvicorn, Jinja2 and PyObjC.

@@ -309,6 +309,8 @@ HELPER_APP = Path(__file__).parent / "DayTrackerHelper.app" / "Contents" / "MacO
 # pre-filtering and mislabelling the timeline.
 OVERLAY_WINDOW_NAMES = {"StatusIndicator"}
 OVERLAY_WINDOW_OWNERS = {"Window Server", "WindowServer"}
+# Core Graphics main-menu and status-window levels: icons are not app content.
+MENU_BAR_WINDOW_LAYERS = {24, 25}
 
 
 def is_overlay_title(title: str) -> bool:
@@ -340,10 +342,11 @@ def get_frontmost_window_title() -> str:
 
 def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
     """
-    Get active window and visible apps using the helper app.
+    Get the active window from the helper and exposed app windows from Quartz.
     The helper app has its own Accessibility permissions, keeping Python unprivileged.
     Window title is supplemented via Quartz (works under launchd where AppleScript can't).
     """
+    visible_apps = get_visible_apps()
     try:
         result = subprocess.run(
             [str(HELPER_APP)],
@@ -357,7 +360,7 @@ def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
 
             if "error" in data:
                 print(f"Helper error: {data['error']}")
-                return None, []
+                return None, visible_apps
 
             # Parse active window
             active_window = None
@@ -380,11 +383,6 @@ def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
                     title=title
                 )
 
-            # Parse visible apps
-            visible_apps = []
-            if data.get("visible_apps"):
-                visible_apps = [a.strip() for a in data["visible_apps"].split("|||") if a.strip()]
-
             return active_window, visible_apps
 
     except subprocess.TimeoutExpired:
@@ -394,7 +392,7 @@ def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
     except Exception as e:
         print(f"Helper failed: {e}")
 
-    return None, []
+    return None, visible_apps
 
 
 def get_active_window() -> Optional[ActiveWindow]:
@@ -404,9 +402,46 @@ def get_active_window() -> Optional[ActiveWindow]:
 
 
 def get_visible_apps() -> List[str]:
-    """Get list of all visible (non-hidden) applications."""
-    _, visible_apps = get_window_info()
-    return visible_apps
+    """Apps with exposed window area on active displays, ordered front to back.
+
+    Quartz omits minimised windows and other Spaces. Clip each window to the
+    displays and subtract opaque windows in front. Bounds are rectangles, so
+    this approximates rounded corners and per-pixel window transparency.
+    """
+    try:
+        displays = _get_display_rects()
+        windows = _cg_onscreen_windows(include_floating=True)
+        apps = []
+        occluders = []
+        system_owners = OVERLAY_WINDOW_OWNERS | {
+            "Dock", "SystemUIServer", "Control Center", "Notification Center",
+            "Control Centre", "Notification Centre",
+        }
+        for window in windows:
+            alpha = window.get("alpha", 1.0)
+            if alpha <= 0:
+                continue
+            owner = window["owner"]
+            # Wispr Flow's overlay bounds do not represent opaque app content.
+            if owner == "Wispr Flow":
+                continue
+            bounds = window["bounds"]
+            if (owner and owner not in system_owners and owner not in apps
+                    and window.get("layer", 0) not in MENU_BAR_WINDOW_LAYERS):
+                for _, x, y, width, height in displays:
+                    clip = (
+                        max(bounds[0], x), max(bounds[1], y),
+                        min(bounds[2], x + width), min(bounds[3], y + height),
+                    )
+                    if _uncovered_area(clip, occluders) > 0:
+                        apps.append(owner)
+                        break
+            if alpha >= 1.0:
+                occluders.append(bounds)
+        return apps
+    except Exception as e:
+        print(f"Visible-app enumeration failed: {e}")
+        return []
 
 
 def get_incognito_windows() -> Tuple[Optional[List[dict]], bool]:
@@ -496,11 +531,12 @@ def _should_log_throttled(key: str, min_interval_s: int = 3600) -> bool:
     return True
 
 
-def _cg_onscreen_windows() -> List[dict]:
+def _cg_onscreen_windows(include_floating: bool = False) -> List[dict]:
     """On-screen normal app windows in front-to-back order, for occlusion tests.
 
-    Returns [{"owner", "pid", "bounds": (x1, y1, x2, y2)}] for opaque, on-screen
-    layer-0 windows. Bounds share the same global point space as CGDisplayBounds
+    Returns [{"owner", "pid", "bounds": (x1, y1, x2, y2), "alpha", "layer"}] for on-screen
+    layer-0 windows with nonzero alpha. include_floating also includes higher
+    layers for app visibility. Bounds share the global point space of CGDisplayBounds
     and the browsers' AppleScript bounds (main-display top-left origin, y-down).
     CGWindowListCopyWindowInfo returns windows front-to-back; filtering to layer 0
     preserves that relative order.
@@ -512,18 +548,24 @@ def _cg_onscreen_windows() -> List[dict]:
     )
     windows = []
     for w in info or []:
-        if int(w.get("kCGWindowLayer", 0)) != 0:
+        layer = int(w.get("kCGWindowLayer", 0))
+        if layer < 0 or (layer != 0 and not include_floating):
             continue
-        if float(w.get("kCGWindowAlpha", 1.0)) <= 0.0:
+        alpha = float(w.get("kCGWindowAlpha", 1.0))
+        if alpha <= 0.0:
             continue
         b = w.get("kCGWindowBounds")
         if not b:
             continue
         x, y, ww, hh = b["X"], b["Y"], b["Width"], b["Height"]
+        if ww <= 0 or hh <= 0:
+            continue
         windows.append({
             "owner": w.get("kCGWindowOwnerName", ""),
             "pid": w.get("kCGWindowOwnerPID"),
             "bounds": (x, y, x + ww, y + hh),
+            "alpha": alpha,
+            "layer": layer,
         })
     return windows
 

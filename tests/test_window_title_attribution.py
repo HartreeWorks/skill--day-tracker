@@ -112,22 +112,30 @@ class GetWindowInfoTests(unittest.TestCase):
         self.assertEqual(active.app, "stable")
         self.assertEqual(visible, ["Fresh Quartz App"])
 
-    def test_visible_apps_are_returned_when_helper_fails(self):
+    def test_window_list_fallback_when_helper_fails(self):
+        fallback = capture.ActiveWindow(app="1Password", title="Vault")
         with patch("capture.subprocess.run", side_effect=RuntimeError("helper unavailable")), \
-             patch("capture.get_visible_apps", return_value=["Fresh Quartz App"]):
+             patch("capture.get_visible_apps", return_value=["Fresh Quartz App"]), \
+             patch("capture.get_frontmost_window_quartz", return_value=fallback), \
+             patch("capture._should_log_throttled", return_value=False):
             active, visible = capture.get_window_info()
 
-        self.assertIsNone(active)
+        self.assertEqual(active, fallback)
         self.assertEqual(visible, ["Fresh Quartz App"])
 
-    def test_visible_apps_are_returned_when_helper_reports_an_error(self):
+    def test_window_list_fallback_when_helper_reports_an_error(self):
         payload = {"error": "Accessibility permission missing", "visible_apps": "Stale|||"}
+        fallback = capture.ActiveWindow(app="1Password", title="Vault")
         with patch("capture.subprocess.run", return_value=helper_result(payload)), \
-             patch("capture.get_visible_apps", return_value=["Fresh Quartz App"]):
+             patch("capture.get_visible_apps", return_value=["Fresh Quartz App"]), \
+             patch("capture.get_frontmost_window_quartz", return_value=fallback), \
+             patch("capture._should_log_throttled", return_value=False):
             active, visible = capture.get_window_info()
 
-        self.assertIsNone(active)
+        self.assertEqual(active, fallback)
         self.assertEqual(visible, ["Fresh Quartz App"])
+        # The fallback keeps the sensitive-window filter working.
+        self.assertTrue(capture.check_sensitive_window(active, capture.CaptureConfig()))
 
 
 class SensitivePreFilterTests(unittest.TestCase):

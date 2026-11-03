@@ -340,6 +340,50 @@ def get_frontmost_window_title() -> str:
     return ""
 
 
+def get_frontmost_window_quartz() -> Optional[ActiveWindow]:
+    """The frontmost app window from the on-screen window list.
+
+    The list is ordered front to back, so the first normal (layer 0) window
+    not owned by a system overlay belongs to the app in front. Needs only the
+    Screen Recording grant the capture already has (for titles), unlike the
+    helper's System Events query, which needs Accessibility and Automation.
+    """
+    try:
+        import Quartz
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID
+        )
+        for win in windows or []:
+            if win.get("kCGWindowLayer", 999) != 0:
+                continue
+            owner = win.get("kCGWindowOwnerName") or ""
+            name = win.get("kCGWindowName") or ""
+            if not owner or owner in OVERLAY_WINDOW_OWNERS or is_overlay_title(name):
+                continue
+            return ActiveWindow(app=owner, title=name)
+    except Exception as e:
+        print(f"Quartz window lookup failed: {e}")
+    return None
+
+
+def _helper_fallback(reason: str) -> Optional[ActiveWindow]:
+    """Labelled fallback: when the helper fails, use the window list instead.
+
+    Without an active window the sensitive-window filter cannot run, so a
+    failed helper must not leave it empty. Logged at most hourly. If the
+    window list yields nothing either, this returns None and the capture
+    proceeds unfiltered, failing open like blank and incognito detection.
+    """
+    if _should_log_throttled("window_helper_unavailable"):
+        log_capture_event(
+            "window_helper_unavailable",
+            "Window helper failed; using the on-screen window list instead",
+            reason=reason,
+        )
+    return get_frontmost_window_quartz()
+
+
 def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
     """
     Get the active window from the helper and exposed app windows from Quartz.
@@ -360,7 +404,7 @@ def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
 
             if "error" in data:
                 print(f"Helper error: {data['error']}")
-                return None, visible_apps
+                return _helper_fallback(f"helper error: {data['error']}"), visible_apps
 
             # Parse active window
             active_window = None
@@ -382,17 +426,22 @@ def get_window_info() -> Tuple[Optional[ActiveWindow], List[str]]:
                     app=data.get("app", ""),
                     title=title
                 )
+            else:
+                return _helper_fallback("helper reported no app"), visible_apps
 
             return active_window, visible_apps
 
     except subprocess.TimeoutExpired:
         print("Helper timed out")
+        return _helper_fallback("helper timed out"), visible_apps
     except json.JSONDecodeError as e:
         print(f"Helper returned invalid JSON: {e}")
+        return _helper_fallback(f"helper returned invalid JSON: {e}"), visible_apps
     except Exception as e:
         print(f"Helper failed: {e}")
+        return _helper_fallback(f"helper failed: {e}"), visible_apps
 
-    return None, visible_apps
+    return _helper_fallback("helper returned nothing"), visible_apps
 
 
 def get_active_window() -> Optional[ActiveWindow]:

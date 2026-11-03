@@ -122,34 +122,28 @@ def is_display_off() -> bool:
         return False  # Assume display is on if we can't check
 
 
-def get_previous_capture_dir() -> Optional[Path]:
-    """Find the most recent capture directory."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_dir = CAPTURES_DIR / today
+def get_previous_capture_dir(exclude: Optional[Path] = None) -> Optional[Path]:
+    """Find the most recent kept capture directory, other than `exclude`.
 
-    if today_dir.exists():
-        # Get all time directories sorted descending
-        time_dirs = sorted(
-            [d for d in today_dir.iterdir() if d.is_dir()],
-            key=lambda d: d.name,
-            reverse=True
-        )
-        if time_dirs:
-            return time_dirs[0]
-
-    # Check yesterday if no captures today
+    The current capture's directory already exists when this runs, so it
+    must be excluded, or every capture is compared with itself and skipped
+    as unchanged. Only directories with saved metadata count: a folder
+    without it is a capture still in progress or one that failed.
+    """
     from datetime import timedelta
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    yesterday_dir = CAPTURES_DIR / yesterday
 
-    if yesterday_dir.exists():
-        time_dirs = sorted(
-            [d for d in yesterday_dir.iterdir() if d.is_dir()],
+    for day in (datetime.now(), datetime.now() - timedelta(days=1)):
+        day_dir = CAPTURES_DIR / day.strftime("%Y-%m-%d")
+        if not day_dir.exists():
+            continue
+        candidates = sorted(
+            (d for d in day_dir.iterdir()
+             if d.is_dir() and d != exclude and (d / "metadata.json").exists()),
             key=lambda d: d.name,
-            reverse=True
+            reverse=True,
         )
-        if time_dirs:
-            return time_dirs[0]
+        if candidates:
+            return candidates[0]
 
     return None
 
@@ -196,7 +190,7 @@ def is_screen_similar_to_previous(capture_dir: Path, screenshots: List[str], thr
     if threshold <= 0:
         return False  # Feature disabled
 
-    prev_dir = get_previous_capture_dir()
+    prev_dir = get_previous_capture_dir(exclude=capture_dir)
     if not prev_dir:
         return False  # No previous capture to compare
 

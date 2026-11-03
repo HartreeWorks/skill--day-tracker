@@ -1187,6 +1187,14 @@
             openModal(path, thumbnailUrl);
         }
 
+        // Escape untrusted text (window titles, Gemini output, log lines)
+        // before it goes into innerHTML.
+        function esc(value) {
+            return String(value ?? '').replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
         function openModal(path, thumbnailUrl) {
             const modal = document.getElementById('modal');
             const modalImages = document.getElementById('modal-images');
@@ -1205,7 +1213,7 @@
                         const screens = capture.screens || [];
                         const isSolo = screens.length === 1;
                         modalImages.innerHTML = screens.map((screen, i) =>
-                            `<img src="/screenshot/${path}/${screen}"
+                            `<img src="/screenshot/${esc(path)}/${esc(screen)}"
                                   alt="Screen ${i + 1}"
                                   class="modal-image ${isSolo ? 'solo' : ''}"
                                   onclick="openFullscreen(this.src)"
@@ -1214,16 +1222,16 @@
 
                         if (capture.analysis) {
                             modalDetails.innerHTML = `
-                                <div class="modal-description">${capture.analysis.description}</div>
+                                <div class="modal-description">${esc(capture.analysis.description)}</div>
                                 <div class="capture-meta">
-                                    <span class="tag category">${capture.analysis.category}</span>
+                                    <span class="tag category">${esc(capture.analysis.category)}</span>
                                     ${capture.manual_project || capture.auto_project ?
-                                        `<span class="tag project">${capture.manual_project || capture.auto_project}</span>` : ''}
+                                        `<span class="tag project">${esc(capture.manual_project || capture.auto_project)}</span>` : ''}
                                     ${capture.analysis.sensitive ?
-                                        `<span class="tag sensitive">Sensitive: ${capture.analysis.sensitive_reason || 'flagged'}</span>` : ''}
+                                        `<span class="tag sensitive">Sensitive: ${esc(capture.analysis.sensitive_reason || 'flagged')}</span>` : ''}
                                 </div>
                                 <p class="modal-active-window">
-                                    Active: ${capture.active_window ? capture.active_window.app + ' — ' + capture.active_window.title : 'Unknown'}
+                                    Active: ${capture.active_window ? esc(capture.active_window.app + ' — ' + capture.active_window.title) : 'Unknown'}
                                 </p>
                             `;
                         }
@@ -1245,7 +1253,7 @@
                 </div>
             `;
 
-            fetch('/api/story?date={{ date }}')
+            fetch('/api/story?date={{ date }}', {method: 'POST'})
                 .then(r => r.json())
                 .then(data => {
                     if (data.html) {
@@ -1256,11 +1264,11 @@
                                 '<p class="cached-note">Cached digest. <a href="#" onclick="regenerateDigest(); return false;">Regenerate</a></p>');
                         }
                     } else if (data.error) {
-                        content.innerHTML = `<p style="color: var(--red);">Error: ${data.error}</p>`;
+                        content.innerHTML = `<p style="color: var(--red);">Error: ${esc(data.error)}</p>`;
                     }
                 })
                 .catch(err => {
-                    content.innerHTML = `<p style="color: var(--red);">Failed to generate digest: ${err.message}</p>`;
+                    content.innerHTML = `<p style="color: var(--red);">Failed to generate digest: ${esc(err.message)}</p>`;
                 })
                 .finally(() => {
                     btn.disabled = false;
@@ -1280,17 +1288,17 @@
                 </div>
             `;
 
-            fetch('/api/story?date={{ date }}&force=true')
+            fetch('/api/story?date={{ date }}&force=true', {method: 'POST'})
                 .then(r => r.json())
                 .then(data => {
                     if (data.html) {
                         content.innerHTML = data.html;
                     } else if (data.error) {
-                        content.innerHTML = `<p style="color: var(--red);">Error: ${data.error}</p>`;
+                        content.innerHTML = `<p style="color: var(--red);">Error: ${esc(data.error)}</p>`;
                     }
                 })
                 .catch(err => {
-                    content.innerHTML = `<p style="color: var(--red);">Failed to regenerate: ${err.message}</p>`;
+                    content.innerHTML = `<p style="color: var(--red);">Failed to regenerate: ${esc(err.message)}</p>`;
                 });
         }
 
@@ -1313,7 +1321,7 @@
                         // Build summary
                         let summaryHtml = '<div class="logs-summary">';
                         for (const [action, count] of Object.entries(data.summary || {})) {
-                            summaryHtml += `<span class="logs-summary-item"><strong>${count}</strong> ${action.replace('_', ' ')}</span>`;
+                            summaryHtml += `<span class="logs-summary-item"><strong>${esc(count)}</strong> ${esc(action.replace('_', ' '))}</span>`;
                         }
                         summaryHtml += '</div>';
 
@@ -1330,11 +1338,11 @@
 
                             logsHtml += `
                                 <div class="log-entry">
-                                    <span class="log-time">${time}</span>
-                                    <span class="log-action ${action}">${action.replace('_', ' ')}</span>
+                                    <span class="log-time">${esc(time)}</span>
+                                    <span class="log-action ${esc(action)}">${esc(action.replace('_', ' '))}</span>
                                     <div>
-                                        <div class="log-message">${log.message || ''}</div>
-                                        ${log.reason ? `<div class="log-details">Reason: ${log.reason}</div>` : ''}
+                                        <div class="log-message">${esc(log.message || '')}</div>
+                                        ${log.reason ? `<div class="log-details">Reason: ${esc(log.reason)}</div>` : ''}
                                     </div>
                                 </div>
                             `;
@@ -1347,7 +1355,7 @@
                     }
                 })
                 .catch(err => {
-                    content.innerHTML = `<p style="color: var(--red);">Failed to load logs: ${err.message}</p>`;
+                    content.innerHTML = `<p style="color: var(--red);">Failed to load logs: ${esc(err.message)}</p>`;
                 });
         }
 

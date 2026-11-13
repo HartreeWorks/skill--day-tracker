@@ -1,9 +1,43 @@
 """Data models for DayLogger."""
 
-from dataclasses import dataclass, field, fields, asdict
+from contextlib import contextmanager
+from dataclasses import dataclass, field, asdict
 from typing import Optional, List
 from datetime import datetime
+from pathlib import Path
+import fcntl
 import json
+import os
+import tempfile
+
+# Serialises read-modify-write of daily logs between the capture, the rollup and
+# tagging. Kept outside ~/Documents so Syncthing never sees it.
+DAILY_LOG_LOCK = Path.home() / "Library" / "Application Support" / "day-tracker" / "daily-log.lock"
+
+
+@contextmanager
+def daily_log_lock():
+    """Hold an exclusive lock while reading, changing and writing a daily log."""
+    DAILY_LOG_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(DAILY_LOG_LOCK, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def write_json_atomic(path, data):
+    """Write JSON so readers see the old file or the new one, never a partial one."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -24,7 +58,7 @@ class Analysis:
     oneline: str
     sensitive: bool = False
     sensitive_reason: Optional[str] = None
-    safety_blocked: bool = False  # Provider blocked analysis; discard the capture
+    explicit: bool = False  # Explicit/sexual imagery — capture is discarded, never stored
     confidence: float = 0.95
     # Enhanced context extraction
     urls: List[str] = field(default_factory=list)  # URLs visible on screen
@@ -34,7 +68,7 @@ class Analysis:
     people: List[str] = field(default_factory=list)  # People names visible (collaborators, meeting attendees)
     organizations: List[str] = field(default_factory=list)  # Organizations visible (clients, companies)
     # Work/personal classification
-    is_work: bool = True  # True = work, False = personal
+    is_work: Optional[bool] = True  # True = work, False = personal, None = unknown (private or unanalysed)
     # Project inference from visible context
     inferred_project: Optional[str] = None  # Folder name from projects.yaml
     project_confidence: float = 0.0  # Confidence in project attribution (0-1)
@@ -68,6 +102,7 @@ class CaptureMetadata:
     manual_project: Optional[str] = None
     excluded_blank_screens: List[str] = field(default_factory=list)  # Screens excluded (wallpaper only)
     excluded_incognito_screens: List[str] = field(default_factory=list)  # Screens discarded (incognito/private browser window visible)
+    excluded_sensitive_screens: List[str] = field(default_factory=list)  # Screens discarded (sensitive app window visible, e.g. 1Password)
     active_sessions: Optional[List[dict]] = None  # Active agent sessions
     focus_history: Optional[List[dict]] = None  # Focus history summary [{app, title, pct}]
     modified_files: Optional[List[str]] = None  # Files modified in the last few minutes
@@ -82,7 +117,8 @@ class CaptureMetadata:
             "auto_project": self.auto_project,
             "manual_project": self.manual_project,
             "excluded_blank_screens": self.excluded_blank_screens,
-            "excluded_incognito_screens": self.excluded_incognito_screens
+            "excluded_incognito_screens": self.excluded_incognito_screens,
+            "excluded_sensitive_screens": self.excluded_sensitive_screens
         }
         if self.active_sessions:
             d["active_sessions"] = self.active_sessions
@@ -94,22 +130,17 @@ class CaptureMetadata:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CaptureMetadata":
-        # Older records may contain analysis fields no longer used by the tracker.
-        analysis_fields = {f.name for f in fields(Analysis)}
-        analysis_data = {
-            key: value for key, value in (d.get("analysis") or {}).items()
-            if key in analysis_fields
-        }
         return cls(
             timestamp=d["timestamp"],
             screens=d["screens"],
             active_window=ActiveWindow(**d["active_window"]) if d.get("active_window") else None,
             visible_apps=d.get("visible_apps", []),
-            analysis=Analysis(**analysis_data) if analysis_data else None,
+            analysis=Analysis(**d["analysis"]) if d.get("analysis") else None,
             auto_project=d.get("auto_project"),
             manual_project=d.get("manual_project"),
             excluded_blank_screens=d.get("excluded_blank_screens", []),
             excluded_incognito_screens=d.get("excluded_incognito_screens", []),
+            excluded_sensitive_screens=d.get("excluded_sensitive_screens", []),
             active_sessions=d.get("active_sessions"),
             focus_history=d.get("focus_history"),
             modified_files=d.get("modified_files")
@@ -122,8 +153,7 @@ class CaptureMetadata:
 
     def save(self, path):
         """Save metadata to a JSON file."""
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        write_json_atomic(path, self.to_dict())
 
     @classmethod
     def load(cls, path) -> "CaptureMetadata":
@@ -141,20 +171,41 @@ class DailyEntry:
     category: str
     project: Optional[str] = None
     sensitive: bool = False
-    is_work: bool = True  # Work vs personal classification
+    is_work: Optional[bool] = True  # Work vs personal; None when unknown (private or unanalysed)
     inferred_project: Optional[str] = None  # AI-inferred project from visible context
     active_app: Optional[str] = None  # App name at capture time
     window_title: Optional[str] = None  # Window title at capture time
     active_sessions: Optional[List[dict]] = None  # Active agent sessions [{agent, title, project_path}]
+    manual_project: Optional[str] = None  # Set by tagging; overrides all automatic attribution
     # Post-capture rollup annotations. These must survive the next capture's
     # DailyLog load/save cycle or the weekly digest loses deterministic fixes.
     canonical_project: Optional[str] = None
     project_suppressed: Optional[bool] = None
     project_gap_filled: Optional[bool] = None
+    calendar_attributed: Optional[bool] = None
+
+    @classmethod
+    def from_metadata(cls, metadata: "CaptureMetadata", capture_dir: str) -> "DailyEntry":
+        """Build an entry from an analysed capture."""
+        return cls(
+            timestamp=metadata.timestamp,
+            capture_dir=capture_dir,
+            oneline=metadata.analysis.oneline,
+            category=metadata.analysis.category,
+            project=metadata.project,
+            sensitive=metadata.analysis.sensitive,
+            is_work=metadata.analysis.is_work,
+            inferred_project=metadata.analysis.inferred_project,
+            active_app=metadata.active_window.app if metadata.active_window else None,
+            window_title=metadata.active_window.title if metadata.active_window else None,
+            active_sessions=metadata.active_sessions,
+            manual_project=metadata.manual_project,
+        )
 
     def to_dict(self) -> dict:
         result = asdict(self)
-        for key in ("canonical_project", "project_suppressed", "project_gap_filled"):
+        for key in ("manual_project", "canonical_project", "project_suppressed", "project_gap_filled",
+                    "calendar_attributed"):
             if result[key] is None:
                 result.pop(key)
         return result
@@ -190,9 +241,8 @@ class DailyLog:
         )
 
     def save(self, path):
-        """Save daily log to JSON."""
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        """Save daily log to JSON atomically. Callers changing it hold daily_log_lock()."""
+        write_json_atomic(path, self.to_dict())
 
     @classmethod
     def load(cls, path) -> "DailyLog":
@@ -204,18 +254,9 @@ class DailyLog:
         """Add a capture to the daily log."""
         if not metadata.analysis:
             return
-
-        entry = DailyEntry(
-            timestamp=metadata.timestamp,
-            capture_dir=capture_dir,
-            oneline=metadata.analysis.oneline,
-            category=metadata.analysis.category,
-            project=metadata.project,
-            sensitive=metadata.analysis.sensitive,
-            is_work=metadata.analysis.is_work,
-            inferred_project=metadata.analysis.inferred_project,
-            active_app=metadata.active_window.app if metadata.active_window else None,
-            window_title=metadata.active_window.title if metadata.active_window else None,
-            active_sessions=metadata.active_sessions
-        )
+        entry = DailyEntry.from_metadata(metadata, capture_dir)
+        for i, existing in enumerate(self.entries):
+            if existing.capture_dir == capture_dir:
+                self.entries[i] = entry
+                return
         self.entries.append(entry)

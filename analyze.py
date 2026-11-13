@@ -174,6 +174,7 @@ Provide a JSON response with these fields:
    - The main application in use
    - The specific task or content visible
    - Any project names, file names, or identifiable context
+   - EXCEPTION: if a screen shows explicit/sexual imagery, nudity, or pornography, do NOT describe it. For that screen write only "explicit imagery (not described)" and nothing more about its visual content.
 
 2. "category": One of [{categories_str}]
 
@@ -184,8 +185,9 @@ Provide a JSON response with these fields:
    - Passwords or credentials
    - Credit card or financial account numbers
    - Personal identification numbers
+   - Explicit or sexual imagery, nudity, or pornography
 
-5. "sensitive_reason": If sensitive is true, briefly explain why (otherwise null).
+5. "sensitive_reason": If sensitive is true, briefly explain why (otherwise null). For explicit/sexual imagery, just say "explicit imagery" — do NOT describe what is shown.
 
 6. "confidence": Your confidence in the analysis (0.0 to 1.0)
 
@@ -206,6 +208,8 @@ Provide a JSON response with these fields:
 14. "inferred_project": String or null - the folder name from KNOWN PROJECTS if you can confidently match this activity to a specific project based on visible content (repo names, URLs, document titles, Slack channels). Use null if no project match or if uncertain.
 
 15. "project_confidence": Float 0-1 - your confidence in the project attribution (0 = no match, 1 = certain match)
+
+16. "explicit": Boolean - true if ANY screenshot contains explicit/sexual imagery, nudity, or pornography. (When true, also set "sensitive" true. This capture will be deleted without being stored.)
 
 Respond ONLY with valid JSON, no markdown or explanation."""
 
@@ -236,6 +240,10 @@ ANALYSIS_SCHEMA = {
             "type": "string",
             "nullable": True,
             "description": "Reason for sensitivity flag"
+        },
+        "explicit": {
+            "type": "boolean",
+            "description": "Whether any screenshot contains explicit/sexual imagery"
         },
         "confidence": {
             "type": "number",
@@ -284,7 +292,7 @@ ANALYSIS_SCHEMA = {
             "description": "Confidence in project attribution (0-1)"
         }
     },
-    "required": ["description", "category", "oneline", "sensitive", "confidence", "urls", "file_paths", "is_meeting", "people", "organizations", "is_work", "inferred_project", "project_confidence"]
+    "required": ["description", "category", "oneline", "sensitive", "explicit", "confidence", "urls", "file_paths", "is_meeting", "people", "organizations", "is_work", "inferred_project", "project_confidence"]
 }
 
 
@@ -376,6 +384,19 @@ def analyze_capture(
 
     from google.genai import types
 
+    # Relax safety thresholds so Gemini *analyses* adult/explicit screenshots
+    # (letting our own "explicit" flag fire and trigger a clean discard) instead
+    # of refusing — a refusal returns no text, which would otherwise leave the
+    # screenshot on disk un-analysed. Truly prohibited content (e.g. CSAM) is
+    # still hard-blocked by Google regardless; that's handled by the block
+    # detection below.
+    safety_settings = [
+        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+    ]
+
     # Build content (prompt + images)
     content = [prompt] + images
 
@@ -387,12 +408,16 @@ def analyze_capture(
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.2,
+                safety_settings=safety_settings,
                 http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
             ),
         )
 
-        # Discard captures when the provider blocks analysis, before accessing
-        # response.text. Record the provider's reason in sensitive_reason.
+        # Backstop: if Gemini still refused on safety grounds (e.g. hard-blocked
+        # content that BLOCK_NONE can't override), it returns no usable text and
+        # `response.text` would raise. Detect that, and treat it as content we
+        # must not keep — flag explicit so run_capture discards the capture
+        # entirely. The reason (finish/category) is recorded in sensitive_reason.
         block_reason = _detect_safety_block(response)
         if block_reason:
             print(f"Gemini refused/blocked analysis (safety): {block_reason}")
@@ -402,7 +427,7 @@ def analyze_capture(
                 oneline="blocked content",
                 sensitive=True,
                 sensitive_reason=f"gemini safety block: {block_reason}",
-                safety_blocked=True,
+                explicit=True,
                 confidence=1.0,
                 is_work=False,
                 model=config.gemini_model,
@@ -430,6 +455,7 @@ def analyze_capture(
             oneline=result.get("oneline", ""),
             sensitive=result.get("sensitive", False),
             sensitive_reason=result.get("sensitive_reason"),
+            explicit=result.get("explicit", False),
             confidence=result.get("confidence", 0.5),
             urls=result.get("urls", []),
             file_paths=result.get("file_paths", []),
@@ -454,7 +480,7 @@ def analyze_capture(
     except Exception as e:
         # Defence-in-depth: a blocked `response.text` access raises. If the error
         # clearly references a safety block, don't silently keep the screenshot —
-        # discard it via the safety_blocked flag.
+        # discard it via the explicit flag (privacy-safe over-discard).
         msg = str(e)
         if any(tok in msg for tok in ("SAFETY", "PROHIBITED", "BLOCKLIST", "IMAGE_SAFETY", "SPII", "blocked", "safety")):
             print(f"Gemini analysis blocked (from exception): {msg[:200]}")
@@ -464,7 +490,7 @@ def analyze_capture(
                 oneline="blocked content",
                 sensitive=True,
                 sensitive_reason=f"gemini safety block: {msg[:120]}",
-                safety_blocked=True,
+                explicit=True,
                 confidence=1.0,
                 is_work=False,
                 model=config.gemini_model,

@@ -31,27 +31,20 @@ python3 ~/.claude/skills/day-tracker/server.py
 
 ## Scheduled Capture
 
-The capture runs every 2 minutes via a launchd agent (`com.ph.daytracker.v2`):
+The capture runs every 2 minutes as the `day-tracker-capture` job in the Hammerspoon scheduler (`~/.agents/scheduler/README.md`):
 
 ```bash
-# View status
-launchctl print gui/$(id -u)/com.ph.daytracker.v2
-
-# View logs
-cat ~/Documents/day-tracker/data/logs/launchd.log
-
-# Disable temporarily
-launchctl bootout gui/$(id -u)/com.ph.daytracker.v2
-
-# Re-enable
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ph.daytracker.v2.plist
-
-# Force an immediate run
-launchctl kickstart gui/$(id -u)/com.ph.daytracker.v2
+scheduler status                          # last run, exit code, next run
+scheduler log day-tracker-capture         # scheduler's view of each run
+cat ~/Documents/day-tracker/data/logs/launchd.log   # the capture's own log
+scheduler run day-tracker-capture         # force an immediate run
 ```
 
-Plist: `~/Library/LaunchAgents/com.ph.daytracker.v2.plist`
-Wrapper: `~/.claude/skills/day-tracker/capture-launchd.py` (calls `run_capture()` directly; `capture.py`'s `main()` exits with code 78 under launchd for unknown reasons).
+To pause it, set `"enabled": false` on the job in `~/.agents/scheduler/jobs/mbp.json`.
+
+Every healthy cycle touches `~/Library/Application Support/day-tracker/heartbeat`: one that writes an entry, or one skipped because capture is paused or the screen is locked, off or blank. The job's `heartbeat` setting makes the scheduler raise a critical alert after 30 minutes of active use (awake, display on, unlocked) without a touch. Lines in `launchd.log` start with a timestamp.
+
+Wrapper: `~/.claude/skills/day-tracker/capture-launchd.py` (calls `run_capture()` directly and adds a 100-second watchdog; the scheduler's own timeout is 110 seconds).
 
 ## macOS Permissions
 
@@ -59,15 +52,15 @@ Grant permissions via System Settings > Privacy & Security, then verify a manual
 
 | App | Permission | Purpose |
 |-----|------------|---------|
-| The process running capture (Python, its launcher or a locally built wrapper) | Screen Recording | Capture screenshots |
+| Hammerspoon (the scheduler that starts the capture) | Screen Recording | Capture screenshots |
 | `DayTrackerHelper.app` | Accessibility | Get active window info |
 | `DayTrackerHelper.app` | Automation (control browsers) | Detect incognito/private windows (see below) |
 
-For incognito detection, macOS will prompt once with "DayTrackerHelper wants to control Google Chrome". Grant it under System Settings > Privacy & Security > Automation. The grant attaches to the helper bundle and persists under launchd. **Detection is fail-open:** if Chrome can't be queried (permission not granted, browser busy), incognito windows are NOT caught and the capture proceeds — so the grant must be in place for protection to work. Watch for `incognito_detection_unavailable` / `incognito_detection_partial` events in `launchd.log` if you suspect the grant has lapsed.
+For incognito detection, macOS will prompt once with "DayTrackerHelper wants to control Google Chrome". Grant it under System Settings > Privacy & Security > Automation. The grant attaches to the helper bundle and persists across scheduled runs. **Detection is fail-open:** if Chrome can't be queried (permission not granted, browser busy), incognito windows are NOT caught and the capture proceeds — so the grant must be in place for protection to work. Watch for `incognito_detection_unavailable` / `incognito_detection_partial` events in `launchd.log` if you suspect the grant has lapsed.
 
 ## Incognito / private window detection
 
-Screenshots of any display showing an **incognito/private browser window** are discarded before analysis — never sent to Gemini, never stored (deleted outright, not even kept as a thumbnail, since a thumbnail would still leak content). This mirrors blank-screen handling: per-display discard, and if *every* display shows incognito the whole capture is skipped.
+Screenshots of any display showing an **incognito/private browser window** are discarded before analysis — never sent to Gemini, never stored (deleted outright, not even kept as a thumbnail, since a thumbnail would still leak content). Each affected display is discarded. If *every* display shows incognito, the cycle is recorded as a content-free `private` entry (see Private entries) so its time still counts.
 
 Detection is **visibility-aware**, not just geometric: a display is only dropped where the incognito window has actually visible (unoccluded) on-screen area. An incognito window that is minimised, hidden, on another Space, or fully buried behind other windows does **not** trigger a discard — only what would really appear in the screenshot. Visibility is computed from the on-screen window list in front-to-back z-order (`CGWindowListCopyWindowInfo`), subtracting any windows stacked in front. A window must expose more than ~64×64 px (`INCOGNITO_VISIBLE_AREA_THRESHOLD` in `capture.py`) to count, so shadow-edge slivers don't cause false discards.
 
@@ -76,19 +69,35 @@ Detection is **visibility-aware**, not just geometric: a display is only dropped
 - **Toggle:** `incognito_detection` in `config.json` (default `true`).
 - **Log events:** `skipped_incognito` (one display dropped), `skipped_all_incognito` (whole capture skipped), `incognito_detection_unavailable` / `incognito_detection_partial` (fail-open — a browser couldn't be queried).
 
+## Sensitive app windows
+
+Screenshots of any display showing a window owned by an app in `sensitive_window_owners` (default `1Password`, `Keychain Access`) are deleted immediately after capture, before any other check reads them and before Gemini sees them. This catches the case the frontmost-window pre-filter misses: the app visible on a display but not focused. Matching is a case-insensitive substring of the window owner, so 1Password's Quick Access panel counts; menu-bar icons do not.
+
+Detection uses the same visibility test as incognito detection, but any exposed area counts, since a revealed password or one-time code needs little room. If every display is affected, the cycle becomes a `private` entry. Detection is **fail-closed**: if the window list can't be read, all screenshots are deleted and the cycle becomes a `private` entry.
+
+## Private entries
+
+A cycle whose content must not be kept still counts as tracked time. These cycles become a `private` entry: the frontmost window matches `sensitive_window_patterns`, every display shows incognito or a sensitive app, sensitive-app detection fails, or analysis flags explicit content or (with `auto_delete_sensitive`) sensitive content. Its screenshots are deleted. The entry keeps only the timestamp and a fixed `oneline` naming the reason, with `category: "private"` and `is_work: null`. It has no window title, app list or description.
+
+When any display is discarded for an incognito or sensitive window, the capture drops the frontmost window's title and every focus-history title before Gemini, the metadata or the daily log see them. Focus-history titles of sensitive apps and of windows matching `sensitive_window_patterns` are always dropped. Deletions decided from the analysis happen before anything from it is logged, and their log lines use fixed text. The focus logger's own files (`data/focus-log/`) still record every window title.
+
+- **Not covered:** the 1Password browser extension's popup, which belongs to the browser's process.
+- **Toggle:** set `sensitive_window_owners` to `[]` in `config.json` to disable.
+- **Log events:** `skipped_sensitive_screen` (one display dropped), `skipped_all_sensitive` (whole capture skipped), `skipped_sensitive_detection_failed` (fail-closed).
+
 ## CLI Commands
 
 ```bash
 # Check status
 python3 ~/.claude/skills/day-tracker/cli.py status
 
-# Pause capturing for 1 hour
+# Pause screenshot capture and focus logging for 1 hour
 python3 ~/.claude/skills/day-tracker/cli.py pause 1h
 
-# Resume capturing
+# Resume both
 python3 ~/.claude/skills/day-tracker/cli.py pause
 
-# Tag last 30 minutes to a project
+# Tag last 30 minutes to a project (overrides automatic attribution from the next rollup)
 python3 ~/.claude/skills/day-tracker/cli.py tag "project-name" --last 30
 
 # Quick recap of recent activity (default: last 30 mins before most recent capture)
@@ -110,6 +119,9 @@ python3 ~/.claude/skills/day-tracker/cli.py summary
 # Generate weekly time digest (human-readable table)
 ~/venvs/ph/bin/python3 ~/.claude/skills/day-tracker/scripts/weekly-digest.py --week 2026-W05
 
+# Recollect only calendar events into an existing sidecar, then re-attribute
+~/venvs/ph/bin/python3 ~/.claude/skills/day-tracker/scripts/daily-rollup.py [YYYY-MM-DD] --skip-completions --refresh-calendar
+
 # Weekly digest with date range
 ~/venvs/ph/bin/python3 ~/.claude/skills/day-tracker/scripts/weekly-digest.py --start 2026-01-26 --end 2026-02-01
 
@@ -121,15 +133,18 @@ python3 ~/.claude/skills/day-tracker/cli.py summary
 
 The daily rollup (`scripts/daily-rollup.py`) post-processes raw daily JSON:
 
+* **Failed-analysis retry** — re-runs Gemini on the day's captures whose analysis failed (offline, timeouts): `unanalysed` entries, and older failed captures that kept their screenshots but never got an entry. Retries stop after 300 captures, 15 minutes or 5 failures in a row; a capture that fails again stays as an `unanalysed` entry. `--skip-reanalysis` turns this off. The same pass copies manual tags from capture metadata to entries and deletes unfinished capture folders (no `metadata.json`, older than 10 minutes), whose screenshots never passed the privacy checks
+* **Calendar attribution** — a capture taken during a qualifying calendar event takes its project from the event (see Calendar attribution)
+* **Manual tags** — an entry's `manual_project` (set by `cli.py tag` or the web UI) becomes its `canonical_project`, ahead of every automatic rule
 * **Project consolidation** — maps AI inference, configured title patterns, and explicit aliases to canonical names from `projects.yaml`
 * **Gap filling** — attributes unclassified entries between same-project entries (within 15-min window)
 * **Summary generation** — populates the `summary` field with time breakdowns by project and category
+* **Coverage** — compares tracked minutes with display-on minutes from `pmset -g log` (`display_on_minutes`, `coverage`, `untracked_display_on_minutes`). A full run raises a warning alert when a weekday with at least 2 hours of display-on time has coverage below 80%. pmset keeps about a week of history; older days get `null`. pmset prints times in the current timezone, so on a day spent in another timezone the comparison is shifted by the difference
 * **Completion signals** — collects "what happened today" data from external sources into a sidecar `.completions.json` file
 
-Runs at 23:55 daily via launchd (`com.claude.scheduled.day-tracker-rollup`). Idempotent — safe to re-run.
+Runs at 23:55 daily as the `day-tracker-rollup` job in the Hammerspoon scheduler (`~/.agents/scheduler/README.md`). If the Mac is asleep at 23:55, it runs on wake for the missed day; only the most recent missed day is caught up. Idempotent — safe to re-run.
 
-Plist: `~/Library/LaunchAgents/com.claude.scheduled.day-tracker-rollup.plist`
-Logs: `/tmp/claude-scheduled-day-tracker-rollup.log`, `/tmp/claude-scheduled-day-tracker-rollup.err`
+Log: `scheduler log day-tracker-rollup`
 
 #### Completion data sources
 
@@ -149,6 +164,20 @@ Agent session presentation uses `gemini-3.1-flash-lite` to generate a compact ti
 Conversation counts mean user-started interactive roots on the target date. `chat_count` and `by_project` remain compatibility aliases with that meaning. Use `interactive_roots_started` and `interactive_roots_by_project` in new consumers. `total_session_count`, `total_sessions_by_project` and `session_origin_counts` retain roots, resumed conversations, subagents, automations and unknown-origin records for diagnostics; never describe those totals as conversations the user initiated. Historical sidecars created before provenance fields existed cannot support a root-only count: report their interactive count as unavailable and show their records separately as legacy totals rather than silently returning zero or reusing the inflated all-session count. In weekly JSON, set the whole-week root count and project breakdown to `null` whenever any included day lacks provenance; expose the provenance-complete subtotal only under `known_interactive_*` keys.
 
 For initiation audits, each session also carries provenance and burden signals: `session_origin` (`interactive_root`, `subagent`, `automation`, or `unknown`), `started_on_target_date`, `user_turn_count`, `followup_count`, `assistant_turn_count`, `assistant_visible_chars`, `duration_minutes`, `gate_disposition`, `gate_injected`, `gate_shown`, and `gate_outcome`. Codex duplicate event/response representations are counted once. Unknown provenance stays unknown rather than being treated as a root. `agent_sessions.initiation_audit` contains aggregate gate counts for interactive roots started on the target date.
+
+### Calendar attribution
+
+Screenshots can't tell whose call Peter is on, so the rollup uses the calendar. An event qualifies when it is timed (not all-day), Peter hasn't declined it (an unanswered invite counts), and someone other than Peter is invited. Meeting rooms and other resources don't count as people.
+
+- **Acme:** any attendee, Peter's own `you@acme.example` included, has an @acme.example address, or the event is on the Acme calendar. Every capture inside it gets `canonical_project: "acme-project"` and `is_work: true`.
+- **Not Acme:** any other qualifying event. Captures inside it get `canonical_project: "non-acme-meeting"`, unless the screenshot already gave a project other than Acme. The attendees are never used to guess a project.
+- **Left alone:** captures with a manual tag, and captures where qualifying events that disagree overlap.
+
+Changed entries carry `calendar_attributed: true`. The "Busy" copies of personal events on the Acme calendar are ignored. The calendar collector records for each event `calendars`, `all_day`, `self_response`, `other_attendee_count` and `has_acme_attendee`, but no attendee addresses. Sidecars collected before these fields existed don't affect attribution; `--refresh-calendar` recollects them.
+
+Event times are compared in the timezone the rollup runs in. To redo a day spent in another timezone, run the rollup with `TZ` set to that timezone, for example `TZ=Europe/London`.
+
+The briefing's Acme hours step (`~/.agents/skills/briefing/scripts/acme-hours.py`) reads `timestamp`, `canonical_project`, `is_work`, `category` and `oneline` from daily entries, and the completions sidecar, to build its evidence digests. Tell Peter before changing their names or meaning.
 
 ### Weekly digest
 
@@ -178,9 +207,13 @@ Categories are split into work and personal for better activity tracking:
 **Fallback:**
 - `other` - Unclassified activity
 
+**Set by the tracker, not the model** (`is_work: null`, counted in `unknown_minutes`):
+- `private` - Content not kept (see Private entries)
+- `unanalysed` - Analysis failed; the rollup retries it
+
 ## Project inference
 
-The AI automatically infers which project you're working on by matching visible content (repo names, URLs, Slack channels, document titles) against your projects list in `~/Documents/Projects/projects.yaml`.
+The AI automatically infers which project you're working on by matching visible content (repo names, URLs, Slack channels, document titles) against your projects list in `~/Projects/projects.yaml`.
 
 Each capture includes:
 - `inferred_project` - The matched project folder name (or null)
@@ -217,6 +250,7 @@ Edit `~/Documents/day-tracker/data/config.json`:
 | `auto_delete_sensitive` | false | Auto-delete captures with detected sensitive content |
 | `blank_desktop_threshold` | 0.02 | Exclude a screen if app windows cover ≤ this fraction of it (0 to disable) |
 | `incognito_detection` | true | Discard per-display screenshots showing a visible Chrome incognito window (see Incognito detection) |
+| `sensitive_window_owners` | `["1Password", "Keychain Access"]` | Discard per-display screenshots showing any visible window of these apps (see Sensitive app windows) |
 
 ## Blank Desktop Detection
 
@@ -299,8 +333,12 @@ The daily log (`YYYY-MM-DD.json`) includes an enhanced `summary` object for Chie
   },
   "summary": {
     "total_tracked_minutes": 480,
-    "work_minutes": 420,
+    "work_minutes": 400,
     "personal_minutes": 60,
+    "unknown_minutes": 20,
+    "display_on_minutes": 510,
+    "coverage": 0.94,
+    "untracked_display_on_minutes": 30,
     "by_project": {"website-redesign": 180, "api-integration": 120},
     "by_category": {"coding": 240, "meetings": 90, "communication": 60},
     "git_commit_count": 8,
@@ -313,8 +351,10 @@ The daily log (`YYYY-MM-DD.json`) includes an enhanced `summary` object for Chie
 }
 ```
 
+The capture, the rollup and tagging change daily logs only while holding a lock (`~/Library/Application Support/day-tracker/daily-log.lock`) and write them atomically. The rollup does its slow work (Gemini retries, completion collection) on a snapshot, then merges in entries the capture wrote meanwhile before saving. A capture lands in the daily log for the day it started, even if it finishes after midnight.
+
 Each entry also includes:
-- `is_work` - Boolean indicating work vs personal activity
+- `is_work` - `true` for work, `false` for personal, `null` for `private` and `unanalysed` entries
 - `inferred_project` - AI-matched project folder name (or null)
 
 ## Web UI

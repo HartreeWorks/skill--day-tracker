@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import hashlib
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -35,8 +36,13 @@ SESSION_SUMMARY_VERSION = "v5"
 MAX_TRANSCRIPT_CHARS = 6000
 MAX_TURN_CHARS = 900
 DEFAULT_MAX_GEMINI_SESSION_SUMMARIES = 50
+# Bounds on session summaries, so a slow Gemini API can't push the rollup past
+# the scheduler's timeout: per request, and in total per collection
+SESSION_SUMMARY_TIMEOUT_MS = 60_000
+SESSION_SUMMARY_BUDGET_SECONDS = 10 * 60
 
 _GEMINI_SESSION_SUMMARY_CALLS = 0
+_SESSION_SUMMARY_DEADLINE = None
 
 def _system_timezone(localtime_path: Optional[Path] = None):
     """Return the OS-configured IANA timezone, with a fixed-offset fallback."""
@@ -289,21 +295,80 @@ def collect_todoist_completed(date_str: str) -> list[dict]:
 # 1c. Calendar events
 # ---------------------------------------------------------------------------
 
+def _event_key(summary: str, start: str) -> tuple[str, str]:
+    """Title plus start instant, so one invite on two calendars counts once."""
+    if "T" in start:
+        try:
+            instant = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            start = instant.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return summary.strip().lower(), start
+
+
+# Peter's own addresses: they never count as "another attendee".
+PETER_EMAILS = {
+    "your-email@gmail.com",
+    "you@acme.example",
+    "your-email@example.com",
+    "your-product@gmail.com",
+    "your-email@example.com",
+}
+
+
+def _attendance(ev: dict) -> dict:
+    """Attendee facts the rollup's calendar attribution needs, without addresses."""
+    attendees = [a for a in ev.get("attendees") or [] if not a.get("resource")]
+    mine = [a for a in attendees if a.get("self") or (a.get("email") or "").lower() in PETER_EMAILS]
+    responses = {a.get("responseStatus") for a in mine}
+    if "accepted" in responses:
+        self_response = "accepted"
+    elif "declined" in responses:
+        self_response = "declined"
+    else:
+        self_response = next(iter(responses), None)
+    return {
+        "self_response": self_response,
+        "other_attendee_count": len(attendees) - len(mine),
+        "has_acme_attendee": any(
+            (a.get("email") or "").lower().endswith("@acme.example") for a in attendees
+        ),
+    }
+
+
+def _merge_event(existing: dict, new: dict) -> None:
+    """Fold a second copy of one event (another calendar, Peter's other address) into the first."""
+    existing["calendars"] = sorted(set(existing["calendars"]) | set(new["calendars"]))
+    existing["other_attendee_count"] = max(existing["other_attendee_count"], new["other_attendee_count"])
+    existing["has_acme_attendee"] = existing["has_acme_attendee"] or new["has_acme_attendee"]
+    responses = {existing["self_response"], new["self_response"]}
+    if "accepted" in responses:
+        existing["self_response"] = "accepted"
+    elif existing["self_response"] is None:
+        existing["self_response"] = new["self_response"]
+
+
 def collect_calendar_events(date_str: str) -> list[dict]:
-    """Collect calendar events from both calendars."""
+    """Collect calendar events from the personal, Meetings and Acme calendars.
+
+    An event found on several calendars appears once, with every calendar in
+    `calendars`; `calendar` keeps the first, for older consumers.
+    """
     calendars = [
-        ("primary", "primary"),
-        ("your-meetings-calendar-id@group.calendar.google.com", "meetings"),
+        ("primary", "primary", "your-email@gmail.com"),
+        ("your-meetings-calendar-id@group.calendar.google.com", "meetings", "your-email@gmail.com"),
+        ("primary", "acme", "you@acme.example"),
     ]
 
     events = []
-    seen_ids: set[str] = set()
+    by_id: dict[str, dict] = {}
+    by_key: dict[tuple[str, str], dict] = {}
 
-    for cal_id, cal_label in calendars:
+    for cal_id, cal_label, account in calendars:
         out = _run([
             "gog", "--json", "cal", "events", cal_id,
             "--from", date_str, "--to", date_str,
-            "--account", "your-email@gmail.com",
+            "--account", account,
             "--max", "50", "--results-only",
         ])
         if not out:
@@ -318,24 +383,35 @@ def collect_calendar_events(date_str: str) -> list[dict]:
                 continue
 
             for ev in data:
-                ev_id = ev.get("id", "")
-                if ev_id and ev_id in seen_ids:
-                    continue
-                if ev_id:
-                    seen_ids.add(ev_id)
-
                 # Extract start/end times
                 start = ev.get("start", {})
                 end = ev.get("end", {})
                 start_time = start.get("dateTime") or start.get("date", "")
                 end_time = end.get("dateTime") or end.get("date", "")
 
-                events.append({
+                # The Acme calendar mirrors Peter's own events as "Busy".
+                if cal_label == "acme" and ev.get("summary", "").strip() == "Busy":
+                    continue
+
+                event = {
                     "summary": ev.get("summary", "(no title)"),
                     "start": start_time,
                     "end": end_time,
                     "calendar": cal_label,
-                })
+                    "calendars": [cal_label],
+                    "all_day": "dateTime" not in start,
+                    **_attendance(ev),
+                }
+                ev_id = ev.get("id", "")
+                key = _event_key(event["summary"], start_time)
+                existing = (by_id.get(ev_id) if ev_id else None) or by_key.get(key)
+                if existing:
+                    _merge_event(existing, event)
+                    continue
+                if ev_id:
+                    by_id[ev_id] = event
+                by_key[key] = event
+                events.append(event)
         except (json.JSONDecodeError, TypeError) as e:
             _warn(f"calendar JSON parse error ({cal_label}): {e}")
 
@@ -965,6 +1041,8 @@ def _summarise_session(session: dict, transcript: dict) -> dict:
     global _GEMINI_SESSION_SUMMARY_CALLS
     if _GEMINI_SESSION_SUMMARY_CALLS >= _gemini_session_summary_limit():
         return _fallback_summary(session, transcript, "gemini_limit_reached", cache_key)
+    if _SESSION_SUMMARY_DEADLINE is not None and time.monotonic() > _SESSION_SUMMARY_DEADLINE:
+        return _fallback_summary(session, transcript, "gemini_time_budget_reached", cache_key)
 
     api_key = _load_gemini_api_key()
     if not api_key:
@@ -1003,6 +1081,7 @@ Evidence bundle:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.2,
+                http_options=types.HttpOptions(timeout=SESSION_SUMMARY_TIMEOUT_MS),
             ),
         )
         data = json.loads(response.text)
@@ -1238,8 +1317,9 @@ def _session_summary_stats(public_sessions: list[dict]) -> dict:
 
 def collect_agent_sessions(date_str: str) -> dict:
     """Collect Claude Code + Codex sessions for one system-local calendar date."""
-    global _GEMINI_SESSION_SUMMARY_CALLS
+    global _GEMINI_SESSION_SUMMARY_CALLS, _SESSION_SUMMARY_DEADLINE
     _GEMINI_SESSION_SUMMARY_CALLS = 0
+    _SESSION_SUMMARY_DEADLINE = time.monotonic() + SESSION_SUMMARY_BUDGET_SECONDS
 
     try:
         day_start, day_end = _day_bounds(date_str)
@@ -1474,10 +1554,26 @@ def collect_agent_sessions(date_str: str) -> dict:
 # 1e. Google Docs edited
 # ---------------------------------------------------------------------------
 
-def collect_google_docs_edited(date_str: str) -> list[dict]:
-    """Collect Google Docs that I personally edited on the given date.
+DOCS_ACCOUNTS = [
+    "your-email@gmail.com",
+    "you@acme.example",
+    "your-email@example.com",
+    "you@other-client.example",
+]
 
-    Shells out to gdoc's own Python to call list_files (which now returns
+
+def collect_google_docs_edited(date_str: str) -> list[dict]:
+    """Collect Google Docs that I personally edited on the given date, across accounts."""
+    docs = []
+    for account in DOCS_ACCOUNTS:
+        for doc in _collect_google_docs_for_account(date_str, account):
+            doc["account"] = account
+            docs.append(doc)
+    return docs
+
+
+def _collect_google_docs_for_account(date_str: str, account: str) -> list[dict]:
+    """Shells out to gdoc's own Python to call list_files (which returns
     modifiedByMeTime), then filters client-side to only include docs where
     modifiedByMeTime falls within the target date.
     """
@@ -1485,6 +1581,8 @@ def collect_google_docs_edited(date_str: str) -> list[dict]:
     script = f"""
 import json
 from gdoc.api.drive import list_files
+from gdoc.util import set_active_account
+set_active_account({account!r})
 query = (
     "modifiedTime > '{date_str}T00:00:00' and "
     "modifiedTime < '{date_str}T23:59:59' and "
@@ -1495,8 +1593,8 @@ print(json.dumps(files))
 """
     out = _run([gdoc_python, "-c", script], timeout=30)
     if not out:
-        _warn("gdoc python call failed, falling back to gog")
-        return _collect_google_docs_via_gog(date_str)
+        _warn(f"gdoc python call failed ({account}), falling back to gog")
+        return _collect_google_docs_via_gog(date_str, account)
 
     try:
         files = json.loads(out)
@@ -1514,22 +1612,22 @@ print(json.dumps(files))
                 })
         return docs
     except (json.JSONDecodeError, TypeError) as e:
-        _warn(f"gdoc JSON parse error: {e}")
-        return _collect_google_docs_via_gog(date_str)
+        _warn(f"gdoc JSON parse error ({account}): {e}")
+        return _collect_google_docs_via_gog(date_str, account)
 
 
-def _collect_google_docs_via_gog(date_str: str) -> list[dict]:
+def _collect_google_docs_via_gog(date_str: str, account: str) -> list[dict]:
     """Fallback: collect docs via gog CLI (no modifiedByMeTime filtering)."""
     query = (
         f"modifiedTime > '{date_str}T00:00:00' and "
         f"modifiedTime < '{date_str}T23:59:59' and "
         "mimeType='application/vnd.google-apps.document' and "
-        "'your-email@gmail.com' in writers"
+        f"'{account}' in writers"
     )
     out = _run([
         "gog", "--json", "drive", "search", query,
         "--raw-query",
-        "--account", "your-email@gmail.com",
+        "--account", account,
         "--max", "50", "--results-only",
     ])
     if not out:
@@ -1756,6 +1854,70 @@ def collect_emails_sent(date_str: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 1g. Slack messages sent
+# ---------------------------------------------------------------------------
+
+SLACK_CLI = Path.home() / ".agents" / "skills" / "slack" / "scripts" / "slack"
+SLACK_WORKSPACES = ["my-workspace", "client-workspace", "community-workspace"]
+
+
+def _slack_matches(out: Optional[str]) -> list[dict]:
+    try:
+        return json.loads(out)["messages"]["matches"] or []
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        _warn(f"slack JSON parse error: {e}")
+        return []
+
+
+def _slack_sent_from_matches(matches: list[dict], workspace: str, date_str: str,
+                             names: Optional[dict] = None, tz=None) -> list[dict]:
+    """Keep matches inside the local day; DM channels are named by user ID."""
+    start, end = _day_bounds(date_str, tz)
+    messages = []
+    for m in matches:
+        try:
+            sent = datetime.fromtimestamp(float(m.get("ts", "")), tz=start.tzinfo)
+        except ValueError:
+            continue
+        if not start <= sent < end:
+            continue
+        ch = m.get("channel") or {}
+        channel = ch.get("name", "")
+        if ch.get("is_im"):
+            channel = f"DM {(names or {}).get(channel, channel)}"
+        messages.append({
+            "workspace": workspace,
+            "channel": channel,
+            "time": sent.isoformat(),
+            "text": (m.get("text") or "")[:300],
+            "permalink": m.get("permalink", ""),
+        })
+    return messages
+
+
+def collect_slack_sent(date_str: str) -> list[dict]:
+    """Collect Slack messages Peter sent on the given date, across workspaces.
+
+    Searches a three-day window and filters locally, because Slack's date
+    modifiers follow the Slack profile's timezone rather than the system's.
+    """
+    day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    query = f"from:me after:{day - timedelta(days=2)} before:{day + timedelta(days=2)}"
+    messages = []
+    for ws in SLACK_WORKSPACES:
+        matches = _slack_matches(_run([str(SLACK_CLI), "-w", ws, "search", query, "100"], timeout=60))
+        names = None
+        if any((m.get("channel") or {}).get("is_im") for m in matches):
+            lookup = _run([str(SLACK_CLI), "-w", ws, "user-lookup"], timeout=60)
+            try:
+                names = json.loads(lookup).get("users") if lookup else None
+            except (json.JSONDecodeError, AttributeError):
+                names = None
+        messages.extend(_slack_sent_from_matches(matches, ws, date_str, names))
+    return sorted(messages, key=lambda m: m["time"])
+
+
+# ---------------------------------------------------------------------------
 # Collect all
 # ---------------------------------------------------------------------------
 
@@ -1768,6 +1930,7 @@ def collect_all(date_str: str) -> dict:
         ("agent_sessions", collect_agent_sessions),
         ("google_docs_edited", collect_google_docs_edited),
         ("emails_sent", collect_emails_sent),
+        ("slack_sent", collect_slack_sent),
     ]
 
     completions: dict = {}

@@ -20,6 +20,7 @@ import sys
 import os
 import signal
 import threading
+from datetime import datetime
 
 LOG_PATH = os.path.expanduser("~/Documents/day-tracker/data/logs/launchd.log")
 WATCHDOG_TIMEOUT_SECONDS = int(
@@ -28,10 +29,34 @@ WATCHDOG_TIMEOUT_SECONDS = int(
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+
+class TimestampedLog:
+    """Prefix each line with the local time, so the log can be read in time order."""
+
+    def __init__(self, f):
+        self.f = f
+        self.at_line_start = True
+
+    def write(self, text):
+        for part in text.splitlines(keepends=True):
+            if self.at_line_start:
+                self.f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S "))
+            self.f.write(part)
+            self.at_line_start = part.endswith("\n")
+        return len(text)
+
+    def flush(self):
+        self.f.flush()
+
+    def fileno(self):
+        return self.f.fileno()
+
+
 # Redirect stdout/stderr to log file
 log_file = open(LOG_PATH, "a")
-sys.stdout = log_file
-sys.stderr = log_file
+sys.stdout = TimestampedLog(log_file)
+sys.stderr = sys.stdout
 
 
 def _watchdog():
@@ -74,4 +99,7 @@ except Exception as e:
     sys.exit(1)
 finally:
     watchdog.cancel()
+    # Detach the wrapper first: Python flushes sys.stdout at exit, and flushing
+    # a closed file makes the process exit 120.
+    sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
     log_file.close()

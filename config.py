@@ -1,6 +1,7 @@
 """Configuration management for Day Tracker."""
 
 import json
+from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -23,6 +24,8 @@ DAILY_DIR = DATA_DIR / "daily"
 REPORTS_DIR = DATA_DIR / "reports"
 CONFIG_FILE = DATA_DIR / "config.json"
 PROJECTS_FILE = DATA_DIR / "projects.json"
+# Touched after every healthy capture cycle; the scheduler alerts when it goes stale.
+HEARTBEAT_FILE = Path.home() / "Library" / "Application Support" / "day-tracker" / "heartbeat"
 
 # External projects.yaml for project inference
 PROJECTS_YAML = Path.home() / "Documents" / "Projects" / "projects.yaml"
@@ -73,6 +76,7 @@ DEFAULT_CONFIG = {
     "blank_desktop_threshold": 0.02,  # Skip a screen if app windows cover <=2% of it (wallpaper only); 0 to disable
     "skip_window_patterns": ["VLC", "TV"],  # Apps to skip capture for (entertainment, no Gemini call)
     "incognito_detection": True,  # Discard per-display screenshots showing a visible Chrome incognito window (fail-open on error)
+    "sensitive_window_owners": ["1Password", "Keychain Access"],  # Discard per-display screenshots showing any visible window of these apps (fail-closed)
     "app_rules": [  # Deterministic app-to-project/category rules (first match wins)
         {"app": "WhatsApp", "category": "social", "project": None, "is_work": False},
         {"app": "Messages", "category": "social", "project": None, "is_work": False},
@@ -101,6 +105,7 @@ class CaptureConfig:
     blank_desktop_threshold: float = 0.02  # Skip a screen if app windows cover <=2% of it (wallpaper only); 0 to disable
     skip_window_patterns: list = field(default_factory=lambda: DEFAULT_CONFIG["skip_window_patterns"].copy())
     incognito_detection: bool = True  # Discard per-display screenshots showing a visible Chrome incognito window
+    sensitive_window_owners: list = field(default_factory=lambda: DEFAULT_CONFIG["sensitive_window_owners"].copy())
     app_rules: list = field(default_factory=lambda: DEFAULT_CONFIG["app_rules"].copy())
 
 
@@ -145,6 +150,7 @@ def save_config(config: CaptureConfig):
         "blank_desktop_threshold": config.blank_desktop_threshold,
         "skip_window_patterns": config.skip_window_patterns,
         "incognito_detection": config.incognito_detection,
+        "sensitive_window_owners": config.sensitive_window_owners,
         "app_rules": config.app_rules
     }
 
@@ -205,3 +211,15 @@ def get_category_is_work(category: str) -> Optional[bool]:
     """
     cat_info = CATEGORIES.get(category, CATEGORIES.get("other"))
     return cat_info.get("is_work") if cat_info else None
+
+
+def is_paused(config: CaptureConfig) -> bool:
+    """Check if capture and focus logging are currently paused."""
+    if not config.pause_until:
+        return False
+
+    try:
+        pause_until = datetime.fromisoformat(config.pause_until)
+        return datetime.now() < pause_until
+    except Exception:
+        return False

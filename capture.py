@@ -12,17 +12,23 @@ import subprocess
 import json
 import re
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple
 
 from PIL import Image
-from config import load_config, CAPTURES_DIR, DAILY_DIR, DATA_DIR, CaptureConfig
-from models import CaptureMetadata, ActiveWindow, Analysis, DailyLog
+from config import load_config, is_paused, CAPTURES_DIR, DAILY_DIR, DATA_DIR, HEARTBEAT_FILE, CaptureConfig
+from models import CaptureMetadata, ActiveWindow, Analysis, DailyLog, daily_log_lock
 from logging_config import log_capture_event, rotate_logs
 
 FOCUS_LOG_DIR = Path.home() / "Documents" / "day-tracker" / "data" / "focus-log"
+# A hung screencapture would otherwise run into the 100 s watchdog and leave
+# unfiltered screenshots behind.
+SCREENCAPTURE_TIMEOUT_SECONDS = 20
+# Capture folders without metadata older than this are unfinished and get deleted.
+ORPHAN_MIN_AGE_SECONDS = 600
 
 # Directories and patterns for modified file detection (mirrors active-directories CLI)
 MODIFIED_FILE_SCAN_DIRS = [
@@ -279,10 +285,15 @@ def capture_screenshots(output_dir: Path, quality: int = 60) -> List[str]:
         # -x: silent (no sound)
         # -t png: lossless capture
         # -D: display number (1-indexed)
-        result = subprocess.run(
-            ["screencapture", "-x", "-t", "png", "-D", str(i), str(tmp_filepath)],
-            capture_output=True
-        )
+        try:
+            subprocess.run(
+                ["screencapture", "-x", "-t", "png", "-D", str(i), str(tmp_filepath)],
+                capture_output=True, timeout=SCREENCAPTURE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"screencapture timed out for display {i}")
+            tmp_filepath.unlink(missing_ok=True)
+            continue
 
         if tmp_filepath.exists():
             filenames.append(filename)
@@ -731,6 +742,47 @@ def get_incognito_display_numbers() -> Tuple[Optional[set], bool]:
     return covered, had_error
 
 
+def get_sensitive_app_display_numbers(owners: List[str]) -> Optional[set]:
+    """Return the display numbers showing any window owned by a sensitive app.
+
+    Matches window owners (case-insensitive substring, so "1Password" also
+    covers its Quick Access panel) against `owners`. Floating panels count;
+    menu-bar icons do not. Visibility-aware like incognito detection: a display
+    is counted only where the window has uncovered on-screen area, with any
+    exposed area counting, since a revealed password or code needs little room.
+
+    Returns a set of 1-indexed display numbers, or None if Quartz enumeration
+    failed (caller fails closed: skip the capture).
+    """
+    needles = [o.lower() for o in owners if o]
+    if not needles:
+        return set()
+    try:
+        displays = _get_display_rects()
+        windows = _cg_onscreen_windows(include_floating=True)
+    except Exception as e:
+        print(f"Sensitive-app window enumeration failed: {e}")
+        return None
+
+    covered = set()
+    occluders = []
+    for window in windows:
+        owner = (window.get("owner") or "").lower()
+        bounds = window["bounds"]
+        if (window.get("layer", 0) not in MENU_BAR_WINDOW_LAYERS
+                and any(n in owner for n in needles)):
+            for num, dx, dy, dw, dh in displays:
+                clip = (
+                    max(bounds[0], dx), max(bounds[1], dy),
+                    min(bounds[2], dx + dw), min(bounds[3], dy + dh),
+                )
+                if _uncovered_area(clip, occluders) > 0:
+                    covered.add(num)
+        if window.get("alpha", 1.0) >= 1.0:
+            occluders.append(bounds)
+    return covered
+
+
 def get_focus_history(minutes: int = 2) -> Optional[List[dict]]:
     """Read recent focus log entries and compute time-per-window percentages.
 
@@ -948,8 +1000,8 @@ def _decode_claude_project_dir(dir_name: str, known_projects: list) -> Optional[
         folder = project.get("folder", "")
         if not folder:
             continue
-        for base in ["~/Documents/Projects/", "~/.agents/skills/",
-                     "~/Documents/www/", "~/"]:
+        for base in ["~/Projects/", "~/.agents/skills/",
+                     "~/www/", "~/"]:
             full_path = base + folder
             encoded = full_path.replace("/", "-").replace(".", "-")
             if dir_name == encoded or dir_name.startswith(encoded):
@@ -1026,18 +1078,6 @@ def match_project(active_window: Optional[ActiveWindow], visible_apps: List[str]
     return None
 
 
-def is_paused(config: CaptureConfig) -> bool:
-    """Check if capture is currently paused."""
-    if not config.pause_until:
-        return False
-
-    try:
-        pause_until = datetime.fromisoformat(config.pause_until)
-        return datetime.now() < pause_until
-    except Exception:
-        return False
-
-
 def get_capture_dir() -> Tuple[Path, str]:
     """Get the capture directory for the current timestamp."""
     now = datetime.now()
@@ -1050,19 +1090,162 @@ def get_capture_dir() -> Tuple[Path, str]:
 
 
 def update_daily_log(metadata: CaptureMetadata, capture_dir: Path):
-    """Add the capture to today's daily log."""
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    """Add the capture to the daily log for the day it was taken.
+
+    The day comes from the capture folder, not the clock, so a capture that
+    finishes after midnight still lands in the day it started.
+    """
+    rel_path = capture_dir.relative_to(CAPTURES_DIR)
+    date_str = rel_path.parts[0]
     daily_file = DAILY_DIR / f"{date_str}.json"
 
-    if daily_file.exists():
-        daily_log = DailyLog.load(daily_file)
-    else:
-        daily_log = DailyLog(date=date_str)
+    with daily_log_lock():
+        if daily_file.exists():
+            daily_log = DailyLog.load(daily_file)
+        else:
+            daily_log = DailyLog(date=date_str)
+        daily_log.add_entry(metadata, str(rel_path))
+        daily_log.save(daily_file)
+    touch_heartbeat()
 
-    # Store relative path from captures dir
-    rel_path = str(capture_dir.relative_to(CAPTURES_DIR))
-    daily_log.add_entry(metadata, rel_path)
-    daily_log.save(daily_file)
+
+def sweep_orphan_captures(day_dir: Path, min_age_seconds: int = ORPHAN_MIN_AGE_SECONDS) -> int:
+    """Delete capture folders that never got metadata.
+
+    A capture killed mid-cycle (watchdog, crash) leaves screenshots that never
+    went through the privacy checks. Folders younger than min_age_seconds may
+    belong to a capture still running, so they are left alone.
+    """
+    if not day_dir.is_dir():
+        return 0
+    cutoff = datetime.now().timestamp() - min_age_seconds
+    removed = 0
+    for capture_dir in day_dir.iterdir():
+        if not capture_dir.is_dir() or (capture_dir / "metadata.json").exists():
+            continue
+        try:
+            if capture_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(capture_dir)
+                removed += 1
+        except OSError as e:
+            print(f"Orphan sweep failed for {capture_dir.name}: {e}")
+    if removed:
+        log_capture_event("swept_orphans", f"Deleted {removed} unfinished capture folder(s)",
+                          details={"day": day_dir.name, "count": removed})
+    return removed
+
+
+def scrub_private_titles(active_window: Optional[ActiveWindow], focus_history: Optional[List[dict]],
+                         config: CaptureConfig, private_display_seen: bool):
+    """Remove window titles that could reveal private content.
+
+    When a display was discarded for an incognito or sensitive window, the
+    frontmost window may be that window, so its title and every focus-history
+    title are dropped. Focus-history titles of sensitive apps or windows are
+    always dropped. App names are kept.
+    """
+    if private_display_seen and active_window:
+        active_window = ActiveWindow(app=active_window.app, title="")
+    if focus_history:
+        owners = [o.lower() for o in config.sensitive_window_owners]
+        patterns = [p.lower() for p in config.sensitive_window_patterns]
+        scrubbed = []
+        for item in focus_history:
+            text = f"{item.get('app', '')} {item.get('title', '')}".lower()
+            private = (private_display_seen
+                       or any(o in (item.get("app") or "").lower() for o in owners)
+                       or any(p in text for p in patterns))
+            scrubbed.append({**item, "title": ""} if private else item)
+        focus_history = scrubbed
+    return active_window, focus_history
+
+
+def touch_heartbeat():
+    """Mark a healthy capture cycle for the scheduler's heartbeat check."""
+    try:
+        HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_FILE.touch()
+    except OSError as e:
+        print(f"Heartbeat update failed: {e}")
+
+
+# Entries that count time without keeping content. Their oneline is fixed text,
+# so nothing about the screen leaks into the daily log.
+PRIVATE_ONELINES = {
+    "incognito": "Private: incognito window (not captured)",
+    "sensitive": "Private: sensitive window (not captured)",
+    "deleted": "Private: content deleted after analysis",
+    "detection_failed": "Private: window check unavailable (not captured)",
+}
+UNANALYSED_ONELINE = "Not analysed (analysis failed; the rollup retries it)"
+
+
+def private_metadata(timestamp: str, reason: str) -> CaptureMetadata:
+    oneline = PRIVATE_ONELINES[reason]
+    return CaptureMetadata(
+        timestamp=timestamp,
+        screens=[],
+        active_window=None,
+        visible_apps=[],
+        analysis=Analysis(description=oneline, category="private", oneline=oneline, is_work=None, confidence=0.0),
+    )
+
+
+def unanalysed_analysis() -> Analysis:
+    return Analysis(description=UNANALYSED_ONELINE, category="unanalysed", oneline=UNANALYSED_ONELINE,
+                    is_work=None, confidence=0.0)
+
+
+def record_private_entry(reason: str, capture_dir: Optional[Path] = None,
+                         timestamp: Optional[str] = None) -> CaptureMetadata:
+    """Count this cycle's time while keeping none of its content.
+
+    Any screenshots are deleted; the entry has no window title, app list or
+    description, so private and sensitive screens still add to tracked time.
+    """
+    if capture_dir is None:
+        capture_dir, timestamp = get_capture_dir()
+    if capture_dir.exists():
+        shutil.rmtree(capture_dir)
+    capture_dir.mkdir(parents=True)
+    metadata = private_metadata(timestamp, reason)
+    metadata.save(capture_dir / "metadata.json")
+    update_daily_log(metadata, capture_dir)
+    return metadata
+
+
+def needs_reanalysis(metadata: CaptureMetadata) -> bool:
+    """True for a capture whose analysis failed (saved before or after placeholders existed)."""
+    return metadata.analysis is None or metadata.analysis.category == "unanalysed"
+
+
+def reanalyse_capture(capture_dir: Path, config: Optional[CaptureConfig] = None) -> Optional[CaptureMetadata]:
+    """Retry analysis for a capture whose analysis failed.
+
+    Returns the updated metadata (saved to disk), or None if the screenshots are
+    gone or analysis fails again. Explicit or auto-deleted sensitive content is
+    discarded and the capture becomes a private entry, as in run_capture.
+    """
+    config = config or load_config()
+    metadata = CaptureMetadata.load(capture_dir / "metadata.json")
+    screens = [s for s in metadata.screens if (capture_dir / s).exists()]
+    if not screens:
+        return None
+    from analyze import analyze_capture
+    analysis = analyze_capture(capture_dir, screens, metadata.active_window, metadata.visible_apps, config,
+                               session_context=metadata.active_sessions, focus_history=metadata.focus_history,
+                               modified_files=metadata.modified_files)
+    if not analysis:
+        return None
+    apply_app_rules(metadata.active_window, analysis, config)
+    if getattr(analysis, "explicit", False) or (analysis.sensitive and config.auto_delete_sensitive):
+        shutil.rmtree(capture_dir)
+        capture_dir.mkdir(parents=True)
+        metadata = private_metadata(metadata.timestamp, "deleted")
+    else:
+        metadata.analysis = analysis
+    metadata.save(capture_dir / "metadata.json")
+    return metadata
 
 
 def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = False) -> Optional[CaptureMetadata]:
@@ -1093,6 +1276,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
             details={"pause_until": config.pause_until}
         )
         print("Capture is paused, skipping.")
+        touch_heartbeat()
         return None
 
     # Check if display is off (screen dimmed due to inactivity)
@@ -1103,6 +1287,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
             reason="Display is asleep/off"
         )
         print("Display is off, skipping capture.")
+        touch_heartbeat()
         return None
 
     # Check if screen is locked
@@ -1113,6 +1298,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
             reason="Screen is locked"
         )
         print("Screen is locked, skipping capture.")
+        touch_heartbeat()
         return None
 
     # Get active window info first (for pre-filtering)
@@ -1126,10 +1312,10 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
             "skipped_sensitive",
             f"Capture skipped: sensitive window ({app_name})",
             reason="Sensitive window pattern matched",
-            details={"app": app_name, "title": active_window.title if active_window else None}
+            details={"app": app_name}
         )
         print(f"Sensitive window detected ({app_name}), skipping capture.")
-        return None
+        return record_private_entry("sensitive")
 
     # Check for video/entertainment apps — log minimal entry, skip screenshots and Gemini
     if check_skip_window(active_window, config):
@@ -1166,6 +1352,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
 
     # Set up capture directory
     capture_dir, timestamp = get_capture_dir()
+    sweep_orphan_captures(capture_dir.parent)
 
     # Capture screenshots
     print(f"Capturing screenshots to {capture_dir}...")
@@ -1182,6 +1369,46 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         details={"screens": len(screenshots), "path": str(capture_dir)}
     )
     print(f"Captured {len(screenshots)} screen(s)")
+
+    # Discard screens showing a sensitive app window (e.g. 1Password) before
+    # anything else reads them. The frontmost-window pre-filter misses these
+    # when the app is visible but unfocused. Fail-closed: if the window list
+    # can't be read, drop the whole capture.
+    excluded_sensitive_screens = []
+    if config.sensitive_window_owners:
+        sensitive_displays = get_sensitive_app_display_numbers(config.sensitive_window_owners)
+        if sensitive_displays is None:
+            log_capture_event(
+                "skipped_sensitive_detection_failed",
+                "Capture skipped: sensitive-app detection unavailable (fail-closed)",
+                reason="Quartz window enumeration failed",
+            )
+            print("Sensitive-app detection unavailable, skipping capture (fail-closed).")
+            return record_private_entry("detection_failed", capture_dir, timestamp)
+        if sensitive_displays:
+            kept = []
+            for screenshot in screenshots:
+                screen_num = int(screenshot.split("-")[1].split(".")[0])
+                if screen_num in sensitive_displays:
+                    (capture_dir / screenshot).unlink(missing_ok=True)
+                    excluded_sensitive_screens.append(f"screen-{screen_num}")
+                    log_capture_event(
+                        "skipped_sensitive_screen",
+                        f"Screen {screen_num} discarded: sensitive app window visible",
+                        details={"screen": screen_num},
+                    )
+                    print(f"Screen {screen_num} shows a sensitive app window, discarding (not described)")
+                else:
+                    kept.append(screenshot)
+            if not kept:
+                log_capture_event(
+                    "skipped_all_sensitive",
+                    "Capture skipped: all screens show sensitive app windows",
+                    details={"sensitive_screens": excluded_sensitive_screens},
+                )
+                print("All screens show sensitive app windows, skipping capture.")
+                return record_private_entry("sensitive", capture_dir, timestamp)
+            screenshots = kept
 
     # Check for black screens (display off)
     black_screens = []
@@ -1201,8 +1428,8 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
                 details={"black_screens": black_screens}
             )
             print("All screens are black (display off), skipping capture.")
-            import shutil
             shutil.rmtree(capture_dir)
+            touch_heartbeat()
             return None
         else:
             # Some screens black - remove them from the list
@@ -1229,8 +1456,8 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
             )
             print(f"Screen unchanged (<{config.skip_similar_threshold*100:.0f}% diff), skipping capture.")
             # Clean up the captured screenshots
-            import shutil
             shutil.rmtree(capture_dir)
+            touch_heartbeat()
             return None
 
     # Filter out blank desktop screens (no application windows — wallpaper only).
@@ -1296,8 +1523,8 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
                     details={"blank_screens": [s for s in excluded_blank_screens]}
                 )
                 print("All screens are blank desktop, skipping capture.")
-                import shutil
                 shutil.rmtree(capture_dir)
+                touch_heartbeat()
                 return None
 
             # Use filtered list for analysis
@@ -1357,9 +1584,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
                     details={"incognito_screens": excluded_incognito_screens},
                 )
                 print("All screens show incognito windows, skipping capture.")
-                import shutil
-                shutil.rmtree(capture_dir)
-                return None
+                return record_private_entry("incognito", capture_dir, timestamp)
 
             screenshots = kept
 
@@ -1388,6 +1613,11 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
     except Exception as e:
         print(f"Modified files lookup failed: {e}")
 
+    active_window, focus_history = scrub_private_titles(
+        active_window, focus_history, config,
+        private_display_seen=bool(excluded_incognito_screens or excluded_sensitive_screens),
+    )
+
     # Auto-detect project
     auto_project = match_project(active_window, visible_apps, config)
 
@@ -1400,6 +1630,7 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
         auto_project=auto_project,
         excluded_blank_screens=excluded_blank_screens,
         excluded_incognito_screens=excluded_incognito_screens,
+        excluded_sensitive_screens=excluded_sensitive_screens,
         active_sessions=active_sessions,
         focus_history=focus_history,
         modified_files=modified_files
@@ -1407,58 +1638,57 @@ def run_capture(config: Optional[CaptureConfig] = None, skip_analysis: bool = Fa
 
     # Analyze with Gemini (unless skipped)
     if not skip_analysis:
+        analysis = None
         try:
             from analyze import analyze_capture
             analysis = analyze_capture(capture_dir, screenshots, active_window, visible_apps, config, session_context=active_sessions, focus_history=focus_history, modified_files=modified_files)
-            metadata.analysis = analysis
-
             # Apply deterministic app rules (override AI inference)
             if analysis:
                 apply_app_rules(active_window, analysis, config)
-
-            # Discard provider-blocked captures before logging or storing analysis.
-            if analysis and analysis.safety_blocked:
-                log_capture_event(
-                    "deleted_safety_blocked",
-                    "Capture deleted: provider blocked analysis",
-                    reason=analysis.sensitive_reason or "Provider safety block",
-                )
-                print("Provider blocked analysis, deleting capture (not stored).")
-                import shutil
-                shutil.rmtree(capture_dir)
-                return None
-
-            if analysis:
-                log_capture_event(
-                    "analyzed",
-                    f"Analysis complete: {analysis.oneline}",
-                    details={
-                        "category": analysis.category,
-                        "is_meeting": analysis.is_meeting,
-                        "people": analysis.people[:3] if analysis.people else [],
-                        "organizations": analysis.organizations[:3] if analysis.organizations else [],
-                        "sensitive": analysis.sensitive
-                    }
-                )
-
-            # Handle sensitive content detection
-            if analysis and analysis.sensitive:
-                print(f"Sensitive content detected: {analysis.sensitive_reason}")
-                if config.auto_delete_sensitive:
-                    log_capture_event(
-                        "deleted_sensitive",
-                        "Capture deleted: sensitive content detected",
-                        reason=analysis.sensitive_reason
-                    )
-                    print("Auto-deleting sensitive capture...")
-                    import shutil
-                    shutil.rmtree(capture_dir)
-                    return None
-
         except Exception as e:
             log_capture_event("error", f"Analysis failed: {e}", reason=str(e))
             print(f"Analysis failed: {e}")
-            # Continue without analysis
+            analysis = None
+
+        # Privacy decisions come before anything from the analysis is logged, and
+        # their log lines use fixed text, so deleted content never reaches
+        # capture.log or launchd.log. Only a content-free private entry is kept,
+        # so the time still counts. Explicit imagery is discarded regardless of
+        # auto_delete_sensitive.
+        if analysis and getattr(analysis, "explicit", False):
+            log_capture_event(
+                "deleted_explicit",
+                "Capture deleted: explicit imagery / safety-blocked content",
+                reason="Flagged explicit by analysis",
+            )
+            print("Explicit/blocked content detected, deleting capture (not stored).")
+            return record_private_entry("deleted", capture_dir, timestamp)
+        if analysis and analysis.sensitive and config.auto_delete_sensitive:
+            log_capture_event(
+                "deleted_sensitive",
+                "Capture deleted: sensitive content detected",
+                reason="Flagged sensitive by analysis",
+            )
+            print("Sensitive content detected, deleting capture (not stored).")
+            return record_private_entry("deleted", capture_dir, timestamp)
+
+        if analysis:
+            metadata.analysis = analysis
+            log_capture_event(
+                "analyzed",
+                f"Analysis complete: {analysis.oneline}",
+                details={
+                    "category": analysis.category,
+                    "is_meeting": analysis.is_meeting,
+                    "people": analysis.people[:3] if analysis.people else [],
+                    "organizations": analysis.organizations[:3] if analysis.organizations else [],
+                    "sensitive": analysis.sensitive
+                }
+            )
+        else:
+            # Keep the time: an unanalysed entry counts now and the rollup retries it.
+            metadata.analysis = unanalysed_analysis()
+            log_capture_event("unanalysed", "Analysis failed; saved as unanalysed for the rollup to retry")
 
     # Save metadata
     metadata_path = capture_dir / "metadata.json"

@@ -6,7 +6,7 @@ This is the source and agent instructions for a personal macOS tool. Use it as a
 
 ## How it works
 
-1. A macOS launchd job captures each display every two minutes, skipping locked or sleeping screens and applying window filters.
+1. A scheduled job captures each display every two minutes, skipping locked or sleeping screens and applying window filters.
 2. Gemini analyses the screenshots alongside window titles, recent focus history, project names and available agent-session context.
 3. Images and structured captions are saved locally. A Python web server displays the timeline at `http://localhost:8765`.
 4. A daily rollup groups activity by project. Optional collectors add commits, agent sessions, calendar events, edited documents, sent emails and completed tasks.
@@ -39,7 +39,7 @@ The app-focus logger is included. Chrome tab-focus reporting comes from a separa
 
 Run `capture.py` for a manual capture and use `capture-launchd.py` as the scheduled entry point. The machine-specific capture app wrapper is excluded from the public copy. The window-information helper is included as readable shell/AppleScript source.
 
-Screenshots and context are sent to Google's Gemini API for analysis, while the files are stored locally. Optional session summaries also send transcript excerpts. Sensitive-window filters run before analysis, but AI sensitivity detection runs after upload. Chrome incognito filtering depends on Automation permission and proceeds with capture if detection fails; other browsers' private modes are not covered. Review these choices before enabling scheduled capture.
+Screenshots and context are sent to Google's Gemini API for analysis, while the files are stored locally. Optional session summaries also send transcript excerpts. Sensitive-window filters run before analysis: the frontmost window's title, and any visible window of an app such as 1Password. AI sensitivity detection runs after upload. Chrome incognito filtering depends on Automation permission and proceeds with capture if detection fails; other browsers' private modes are not covered. Review these choices before enabling scheduled capture.
 
 ## Get the skill
 

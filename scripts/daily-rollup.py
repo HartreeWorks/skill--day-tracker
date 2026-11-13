@@ -2,9 +2,10 @@
 """Daily rollup script for day-tracker.
 
 Post-processes the raw daily JSON to:
-1. Map inferred_project values to canonical project names via fuzzy matching
-2. Fill gaps in unclassified entries between same-project entries
-3. Populate the summary field with time breakdowns
+1. Retry analysis for captures whose Gemini call failed
+2. Map inferred_project values to canonical project names via fuzzy matching
+3. Fill gaps in unclassified entries between same-project entries
+4. Populate the summary field with time breakdowns and display-on coverage
 
 Usage:
     python3 daily-rollup.py [YYYY-MM-DD]
@@ -19,7 +20,8 @@ import os
 import re
 import subprocess
 import sys
-from collections import defaultdict
+import time
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -52,6 +54,18 @@ CAPTURE_INTERVAL = 2
 GAP_THRESHOLD = 15
 # Minimum captures to consider data reliable
 LOW_DATA_THRESHOLD = 20
+# Limits on Gemini retries per rollup, so a slow or unreachable API can't run
+# the job past the scheduler's timeout before it saves anything
+MAX_REANALYSES = 300
+REANALYSIS_BUDGET_SECONDS = 15 * 60
+MAX_CONSECUTIVE_REANALYSIS_FAILURES = 5
+# Calendar attribution: a capture inside a qualifying event takes its project from the event
+ACME_PROJECT = "acme-project"
+NON_ACME_MEETING = "non-acme-meeting"
+# Weekday coverage below this, with at least COVERAGE_MIN_DISPLAY_MINUTES of display-on time, raises an alert
+COVERAGE_ALERT_THRESHOLD = 0.8
+COVERAGE_MIN_DISPLAY_MINUTES = 120
+PMSET_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) [+-]\d{4}\s+(\w+)\s+(.*)$")
 TERMINAL_APPS = {"stable", "warp", "terminal", "iterm", "iterm2", "ghostty"}
 
 
@@ -106,7 +120,7 @@ def build_alias_map(projects):
         for alias in p.get("aliases", []):
             if alias:
                 alias_map[str(alias).lower()] = folder
-        # Folder without date prefix (e.g. "forethought-ai-uplift")
+        # Folder without date prefix (e.g. "acme-ai-uplift")
         parts = folder.split("-", 3)
         if len(parts) >= 4 and parts[0].isdigit() and parts[1].isdigit():
             short = "-".join(parts[2:])
@@ -241,6 +255,75 @@ def apply_project_mapping(entries, projects, config=None):
                 entry["is_work"] = rule["is_work"]
             break
 
+    # Manual tags beat every automatic rule.
+    for entry in entries:
+        manual = entry.get("manual_project")
+        if manual:
+            manual_canonical, _ = fuzzy_match_project(manual, alias_map, projects)
+            entry["canonical_project"] = manual_canonical or manual
+            entry.pop("project_suppressed", None)
+
+
+def calendar_windows(events):
+    """(start, end, is_acme) for each event that decides attribution.
+
+    An event qualifies when it is timed (not all-day), Peter hasn't declined
+    it, and someone other than Peter is invited. It is Acme when any
+    attendee, Peter included, uses an @acme.example address, or when it is
+    on the Acme calendar. Events from sidecars collected before
+    attendee facts were recorded never qualify. Times are converted to the
+    local timezone of the process, which is the timezone capture timestamps
+    use when the rollup runs on the same machine and day.
+    """
+    windows = []
+    for ev in events:
+        if ev.get("all_day") or ev.get("self_response") == "declined":
+            continue
+        if not ev.get("other_attendee_count"):
+            continue
+        try:
+            start = datetime.fromisoformat(ev["start"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(ev["end"].replace("Z", "+00:00"))
+        except (KeyError, ValueError, AttributeError):
+            continue
+        if start.tzinfo is None or end.tzinfo is None:
+            continue
+        is_acme = bool(ev.get("has_acme_attendee")) or "acme" in (ev.get("calendars") or [])
+        windows.append((start.astimezone().replace(tzinfo=None), end.astimezone().replace(tzinfo=None), is_acme))
+    return windows
+
+
+def apply_calendar_attribution(entries, events):
+    """Set the project of captures taken during a qualifying calendar event.
+
+    Acme events make the capture Acme work. Other events mark it
+    non-Acme: its project becomes NON_ACME_MEETING unless the
+    screenshot already gave a project other than Acme. When qualifying
+    events that disagree overlap, or a capture has a manual tag, the calendar
+    leaves it alone.
+    """
+    windows = calendar_windows(events)
+    for entry in entries:
+        entry.pop("calendar_attributed", None)
+        if not windows or entry.get("manual_project"):
+            continue
+        try:
+            t = datetime.fromisoformat(entry["timestamp"])
+        except (KeyError, ValueError):
+            continue
+        kinds = {ft for start, end, ft in windows if start <= t < end}
+        if len(kinds) != 1:
+            continue
+        if kinds == {True}:
+            entry["canonical_project"] = ACME_PROJECT
+            entry["is_work"] = True
+        elif entry.get("canonical_project") in (None, ACME_PROJECT):
+            entry["canonical_project"] = NON_ACME_MEETING
+        else:
+            continue
+        entry.pop("project_suppressed", None)
+        entry["calendar_attributed"] = True
+
 
 def fill_gaps(entries):
     """Attribute unclassified entries between same-project entries.
@@ -277,11 +360,177 @@ def fill_gaps(entries):
             entry["project_gap_filled"] = True
 
 
+def recover_unanalysed(date_str, entries):
+    """Retry failed analyses and refresh manual tags from capture metadata.
+
+    Covers unanalysed placeholder entries, older failed captures that kept
+    their screenshots and metadata but got no entry, and tags set on capture
+    metadata that never reached the entry. A capture that fails again stays as
+    an unanalysed entry, so its time still counts. Retries stop at the time
+    budget or after several failures in a row (usually offline).
+
+    Mutates entries. Returns (counts, capture_dirs of entries it changed).
+    """
+    day_dir = DAILY_DIR.parent / "captures" / date_str
+    stats = Counter()
+    touched = set()
+    if not day_dir.is_dir():
+        return stats, touched
+
+    from capture import needs_reanalysis, reanalyse_capture, sweep_orphan_captures, unanalysed_analysis
+    from models import CaptureMetadata, DailyEntry
+
+    swept = sweep_orphan_captures(day_dir)
+    if swept:
+        stats["orphans_swept"] = swept
+
+    deadline = time.monotonic() + REANALYSIS_BUDGET_SECONDS
+    consecutive_failures = 0
+    by_dir = {e.get("capture_dir"): e for e in entries}
+    for meta_path in sorted(day_dir.glob("*/metadata.json")):
+        rel_dir = f"{date_str}/{meta_path.parent.name}"
+        entry = by_dir.get(rel_dir)
+        try:
+            metadata = CaptureMetadata.load(meta_path)
+        except (OSError, ValueError, KeyError, TypeError):
+            stats["unreadable"] += 1
+            continue
+
+        if entry is not None and entry.get("category") != "unanalysed":
+            if (metadata.manual_project or None) != entry.get("manual_project"):
+                if metadata.manual_project:
+                    entry["manual_project"] = metadata.manual_project
+                else:
+                    entry.pop("manual_project", None)
+                touched.add(rel_dir)
+                stats["tags_refreshed"] += 1
+            continue
+
+        if needs_reanalysis(metadata):
+            updated = None
+            can_retry = (stats["reanalysed"] + stats["still_unanalysed"] < MAX_REANALYSES
+                         and time.monotonic() < deadline
+                         and consecutive_failures < MAX_CONSECUTIVE_REANALYSIS_FAILURES)
+            if can_retry:
+                try:
+                    updated = reanalyse_capture(meta_path.parent)
+                except Exception as e:
+                    print(f"  Reanalysis failed for {rel_dir}: {e}", file=sys.stderr)
+            if updated:
+                metadata = updated
+                stats["reanalysed"] += 1
+                consecutive_failures = 0
+            else:
+                stats["still_unanalysed" if can_retry else "retry_deferred"] += 1
+                consecutive_failures += can_retry
+                if metadata.analysis is None:
+                    metadata.analysis = unanalysed_analysis()
+        new_entry = DailyEntry.from_metadata(metadata, rel_dir).to_dict()
+        if entry is None:
+            entries.append(new_entry)
+            stats["added"] += 1
+        else:
+            entry.clear()
+            entry.update(new_entry)
+        touched.add(rel_dir)
+    entries.sort(key=lambda e: e.get("timestamp", ""))
+    return stats, touched
+
+
+def merge_entries(on_disk, ours, touched):
+    """Combine the daily log as it is now with the rollup's changes.
+
+    The capture may have appended entries while the rollup was busy. Entries
+    the rollup changed take its version; everything else comes from disk.
+    """
+    ours_by_dir = {e.get("capture_dir"): e for e in ours}
+    merged = {e.get("capture_dir"): e for e in on_disk}
+    for capture_dir in touched:
+        if capture_dir in ours_by_dir:
+            merged[capture_dir] = ours_by_dir[capture_dir]
+    return sorted(merged.values(), key=lambda e: e.get("timestamp", ""))
+
+
+def display_on_minutes(date_str, pmset_text=None, now=None):
+    """Minutes the display was on during date_str, from `pmset -g log`.
+
+    Returns None when pmset history does not reach back to the start of the
+    day. pmset prints every event in the current timezone, so a day spent in
+    another timezone is shifted by the difference.
+    """
+    if pmset_text is None:
+        try:
+            pmset_text = subprocess.run(["pmset", "-g", "log"], capture_output=True,
+                                        text=True, timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    now = now or datetime.now()
+    day_start = datetime.strptime(date_str, "%Y-%m-%d")
+    day_end = min(day_start + timedelta(days=1), now)
+
+    first_event = None
+    on_since = None
+    seconds = 0.0
+    for line in pmset_text.splitlines():
+        m = PMSET_LINE.match(line)
+        if not m:
+            continue
+        ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        first_event = first_event or ts
+        kind, rest = m.group(2), m.group(3)
+        if "Display is turned on" in rest:
+            on_since = on_since or ts
+        elif on_since and ("Display is turned off" in rest or (kind == "Sleep" and "Entering Sleep" in rest)):
+            seconds += max(0.0, (min(ts, day_end) - max(on_since, day_start)).total_seconds())
+            on_since = None
+    if on_since:
+        seconds += max(0.0, (day_end - max(on_since, day_start)).total_seconds())
+    if first_event is None or first_event > day_start:
+        return None
+    return round(seconds / 60)
+
+
+def add_coverage(summary, date_str, display_minutes):
+    """Compare tracked time with display-on time; True when a weekday's coverage is low."""
+    summary["display_on_minutes"] = display_minutes
+    if not display_minutes:
+        summary["coverage"] = None
+        summary["untracked_display_on_minutes"] = None
+        return False
+    tracked = summary["total_tracked_minutes"]
+    summary["coverage"] = round(tracked / display_minutes, 2)
+    summary["untracked_display_on_minutes"] = max(0, display_minutes - tracked)
+    weekday = datetime.strptime(date_str, "%Y-%m-%d").weekday() < 5
+    return (weekday and display_minutes >= COVERAGE_MIN_DISPLAY_MINUTES
+            and summary["coverage"] < COVERAGE_ALERT_THRESHOLD)
+
+
+def add_completion_counts(summary, completions):
+    """Add counts of the day's completion signals to the summary."""
+    git_commits = completions.get("git_commits", [])
+    summary["git_commit_count"] = len([c for c in git_commits if isinstance(c, dict) and "repo" in c])
+
+    agent_sessions = completions.get("agent_sessions", {})
+    roots_started, total_records = agent_session_counts(agent_sessions)
+    summary["agent_session_count"] = roots_started
+    summary["interactive_roots_started"] = roots_started
+    summary["total_agent_session_count"] = total_records
+
+    summary["calendar_event_count"] = len(completions.get("calendar_events", []))
+    summary["emails_sent_count"] = len(completions.get("emails_sent", []))
+    summary["google_docs_edited_count"] = len(completions.get("google_docs_edited", []))
+
+
 def compute_summary(entries):
-    """Compute time summary from entries."""
+    """Compute time summary from entries.
+
+    is_work None (private or unanalysed entries) counts towards
+    unknown_minutes; a missing is_work counts as work, as it always has.
+    """
     total_minutes = len(entries) * CAPTURE_INTERVAL
     work_minutes = sum(CAPTURE_INTERVAL for e in entries if e.get("is_work", True))
-    personal_minutes = total_minutes - work_minutes
+    personal_minutes = sum(CAPTURE_INTERVAL for e in entries if e.get("is_work") is False)
+    unknown_minutes = total_minutes - work_minutes - personal_minutes
 
     by_project = defaultdict(int)
     by_category = defaultdict(int)
@@ -301,6 +550,7 @@ def compute_summary(entries):
         "total_tracked_minutes": total_minutes,
         "work_minutes": work_minutes,
         "personal_minutes": personal_minutes,
+        "unknown_minutes": unknown_minutes,
         "by_project": dict(sorted(by_project.items(), key=lambda x: -x[1])),
         "by_category": dict(sorted(by_category.items(), key=lambda x: -x[1])),
         "low_data": low_data,
@@ -334,49 +584,32 @@ def send_alert(severity: str, title: str, message: str) -> None:
         print(f"Alert delivery failed: {e}", file=sys.stderr)
 
 
-def run_rollup(date_str, collect_completions=True):
+def run_rollup(date_str, collect_completions=True, reanalyse=True, refresh_calendar=False):
     """Run the daily rollup for a given date.
 
-    Processes screenshot entries if available (project mapping, gap filling,
-    summary). Completion collection can be disabled for a side-effect-free
-    historical refresh that preserves an existing sidecar.
+    Retries failed analyses and collects completion signals on a snapshot of
+    the daily log, then, holding the daily-log lock, merges in anything the
+    capture wrote meanwhile, recomputes attribution and the summary, and
+    writes the file atomically. Completion collection can be disabled to
+    preserve an existing sidecar; reanalyse=False avoids Gemini calls as well.
+    refresh_calendar recollects only calendar events into the existing sidecar.
     """
+    from models import daily_log_lock, write_json_atomic
+
     daily_file = DAILY_DIR / f"{date_str}.json"
-    has_entries = False
 
-    if daily_file.exists():
-        with open(daily_file) as f:
-            data = json.load(f)
-        entries = data.get("entries", [])
-        has_entries = len(entries) > 0
+    def load_daily():
+        if daily_file.exists():
+            with open(daily_file) as f:
+                return json.load(f)
+        return {"date": date_str, "entries": []}
+
+    # Slow work happens outside the lock, on a snapshot.
+    snapshot = load_daily().get("entries", [])
+    if reanalyse:
+        recovery, touched = recover_unanalysed(date_str, snapshot)
     else:
-        data = {"date": date_str, "entries": []}
-        entries = []
-
-    # Process screenshot entries if present
-    if has_entries:
-        projects = load_projects()
-
-        try:
-            from config import load_config
-            config = load_config()
-        except Exception as e:
-            config = None
-            print(f"Warning: Could not load deterministic project/app rules: {e}")
-
-        apply_project_mapping(entries, projects, config)
-        fill_gaps(entries)
-        summary = compute_summary(entries)
-    else:
-        summary = {
-            "total_tracked_minutes": 0,
-            "work_minutes": 0,
-            "personal_minutes": 0,
-            "by_project": {},
-            "by_category": {},
-            "low_data": True,
-            "rollup_timestamp": datetime.now().isoformat(),
-        }
+        recovery, touched = Counter(), set()
 
     completions_file = DAILY_DIR / f"{date_str}.completions.json"
     if collect_completions:
@@ -390,49 +623,66 @@ def run_rollup(date_str, collect_completions=True):
             completions = {}
     else:
         completions = {}
+    if refresh_calendar and not collect_completions:
+        from collectors import collect_calendar_events
+        completions["calendar_events"] = collect_calendar_events(date_str)
 
-    # Add completion counts to summary
-    git_commits = completions.get("git_commits", [])
-    summary["git_commit_count"] = len([c for c in git_commits if isinstance(c, dict) and "repo" in c])
+    display_minutes = display_on_minutes(date_str)
+    projects = load_projects()
+    try:
+        from config import load_config
+        config = load_config()
+    except Exception as e:
+        config = None
+        print(f"Warning: Could not load deterministic project/app rules: {e}")
 
-    agent_sessions = completions.get("agent_sessions", {})
-    roots_started, total_records = agent_session_counts(agent_sessions)
-    summary["agent_session_count"] = roots_started
-    summary["interactive_roots_started"] = roots_started
-    summary["total_agent_session_count"] = total_records
+    with daily_log_lock():
+        data = load_daily()
+        entries = merge_entries(data.get("entries", []), snapshot, touched)
+        has_entries = len(entries) > 0
 
-    calendar_events = completions.get("calendar_events", [])
-    summary["calendar_event_count"] = len(calendar_events)
+        if has_entries:
+            apply_project_mapping(entries, projects, config)
+            apply_calendar_attribution(entries, completions.get("calendar_events", []))
+            fill_gaps(entries)
+            summary = compute_summary(entries)
+        else:
+            summary = {
+                "total_tracked_minutes": 0,
+                "work_minutes": 0,
+                "personal_minutes": 0,
+                "unknown_minutes": 0,
+                "by_project": {},
+                "by_category": {},
+                "low_data": True,
+                "rollup_timestamp": datetime.now().isoformat(),
+            }
+        add_completion_counts(summary, completions)
+        low_coverage = add_coverage(summary, date_str, display_minutes)
 
-    emails_sent = completions.get("emails_sent", [])
-    summary["emails_sent_count"] = len(emails_sent)
-
-    google_docs = completions.get("google_docs_edited", [])
-    summary["google_docs_edited_count"] = len(google_docs)
-
-    # Remove old inline completions if present (migration from v1)
-    data.pop("completions", None)
-
-    data["summary"] = summary
-    data["entries"] = entries
-
-    # Write main daily file (entries + summary only)
-    with open(daily_file, "w") as f:
-        json.dump(data, f, indent=2)
+        # Remove old inline completions if present (migration from v1)
+        data.pop("completions", None)
+        data["summary"] = summary
+        data["entries"] = entries
+        write_json_atomic(daily_file, data)
 
     # Write completions to sidecar file
-    if collect_completions:
-        with open(completions_file, "w") as f:
-            json.dump(completions, f, indent=2)
+    if collect_completions or refresh_calendar:
+        write_json_atomic(completions_file, completions)
 
     print(f"Rollup complete for {date_str}:")
+    if recovery:
+        print(f"  Failed analyses: {dict(recovery)}")
     if has_entries:
         print(f"  Entries: {len(entries)}")
         print(f"  Total: {summary['total_tracked_minutes']}min")
-        print(f"  Work: {summary['work_minutes']}min, Personal: {summary['personal_minutes']}min")
+        print(f"  Work: {summary['work_minutes']}min, Personal: {summary['personal_minutes']}min, "
+              f"Unknown: {summary['unknown_minutes']}min")
         print(f"  Projects: {len(summary['by_project'])}")
     else:
         print(f"  No screenshot data (completions only)")
+    if summary["display_on_minutes"] is not None:
+        print(f"  Display on: {summary['display_on_minutes']}min, coverage {summary['coverage']}")
     print(f"  Git commits: {summary['git_commit_count']}")
     if summary["interactive_roots_started"] is None:
         print("  Interactive conversations started: unavailable (legacy data lacks provenance)")
@@ -443,6 +693,9 @@ def run_rollup(date_str, collect_completions=True):
     print(f"  Calendar events: {summary['calendar_event_count']}")
     print(f"  Emails sent: {summary['emails_sent_count']}")
     print(f"  Google Docs edited: {summary['google_docs_edited_count']}")
+    calendar_count = sum(1 for e in entries if e.get("calendar_attributed"))
+    if calendar_count:
+        print(f"  Attributed from calendar: {calendar_count} entries")
     if collect_completions:
         print(f"  Completions: {completions_file}")
     else:
@@ -455,6 +708,15 @@ def run_rollup(date_str, collect_completions=True):
             "critical",
             f"Rollup collector errors ({date_str})",
             "\n".join(collector_errors),
+        )
+
+    if collect_completions and low_coverage:
+        send_alert(
+            "warning",
+            f"Day tracker missed time ({date_str})",
+            f"Tracked {summary['total_tracked_minutes']} of {summary['display_on_minutes']} display-on minutes "
+            f"({summary['coverage']:.0%}). Check `scheduler status` and "
+            "~/Documents/day-tracker/data/logs/launchd.log.",
         )
 
     # Alert if no screenshot data for 3+ consecutive days
@@ -493,6 +755,16 @@ def main():
         action="store_true",
         help="Refresh screenshot rollup without recollecting or overwriting completion signals",
     )
+    parser.add_argument(
+        "--refresh-calendar",
+        action="store_true",
+        help="With --skip-completions, recollect calendar events into the existing sidecar",
+    )
+    parser.add_argument(
+        "--skip-reanalysis",
+        action="store_true",
+        help="Do not retry failed analyses (no Gemini calls for screenshots)",
+    )
     args = parser.parse_args()
     date_str = args.date or datetime.now().strftime("%Y-%m-%d")
 
@@ -504,7 +776,8 @@ def main():
         sys.exit(1)
 
     try:
-        run_rollup(date_str, collect_completions=not args.skip_completions)
+        run_rollup(date_str, collect_completions=not args.skip_completions,
+                   reanalyse=not args.skip_reanalysis, refresh_calendar=args.refresh_calendar)
     except Exception as e:
         send_alert("critical", f"Rollup script crashed ({date_str})", str(e))
         raise

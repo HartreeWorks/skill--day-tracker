@@ -246,17 +246,12 @@ async def api_tag(request: Request):
     captures = data.get("captures", [])  # List of paths like "2025-12-28/14-30-00"
     project = data.get("project", "")
 
-    updated = 0
-    for capture_path in captures:
-        metadata_file = CAPTURES_DIR / capture_path / "metadata.json"
-        if metadata_file.exists():
-            try:
-                metadata = CaptureMetadata.load(metadata_file)
-                metadata.manual_project = project if project else None
-                metadata.save(metadata_file)
-                updated += 1
-            except Exception as e:
-                print(f"Error updating {metadata_file}: {e}")
+    from tags import tag_captures
+    try:
+        updated = tag_captures(captures, project)
+    except Exception as e:
+        print(f"Error tagging captures: {e}")
+        updated = 0
 
     return {"updated": updated, "project": project}
 

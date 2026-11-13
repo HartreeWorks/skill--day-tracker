@@ -145,8 +145,6 @@ def cmd_serve(args):
 
 def cmd_tag(args):
     """Tag recent captures."""
-    from models import CaptureMetadata
-
     project = args.project
     minutes = args.last
 
@@ -161,7 +159,7 @@ def cmd_tag(args):
         print("No captures today")
         return
 
-    tagged = 0
+    selected = []
     for time_dir in sorted(today_dir.iterdir(), reverse=True):
         if not time_dir.is_dir():
             continue
@@ -176,18 +174,11 @@ def cmd_tag(args):
         if capture_time < cutoff:
             break  # Past the time window
 
-        metadata_file = time_dir / "metadata.json"
-        if metadata_file.exists():
-            try:
-                metadata = CaptureMetadata.load(metadata_file)
-                metadata.manual_project = project
-                metadata.save(metadata_file)
-                tagged += 1
-                print(f"Tagged {time_dir.name} -> {project}")
-            except Exception as e:
-                print(f"Error tagging {time_dir.name}: {e}")
+        selected.append(f"{today}/{time_dir.name}")
 
-    print(f"Tagged {tagged} capture(s) as '{project}'")
+    from tags import tag_captures
+    tagged = tag_captures(selected, project)
+    print(f"Tagged {tagged} capture(s) as '{project}'. Totals update at the next rollup.")
 
 
 def cmd_logs(args):

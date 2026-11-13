@@ -22,6 +22,8 @@ import AppKit
 import Quartz
 from Foundation import NSObject, NSRunLoop, NSDate
 
+from config import load_config, is_paused
+
 FOCUS_LOG_DIR = Path.home() / "Documents" / "day-tracker" / "data" / "focus-log"
 HTTP_PORT = 7847
 
@@ -127,6 +129,9 @@ class FocusObserver(NSObject):
     def write_entry(self, app: str, title: str):
         """Write a focus entry to the log file. Thread-safe via GIL for simple appends."""
         try:
+            # Honour `cli.py pause`, which also pauses screenshot capture
+            if is_paused(load_config()):
+                return
             self._ensure_correct_date()
             entry = {
                 "t": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
